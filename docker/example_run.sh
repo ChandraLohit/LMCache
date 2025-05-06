@@ -1,6 +1,6 @@
-IMAGE=<IMAGE_NAME>:<TAG>
+IMAGE=vllm/openai:membrain
 docker run --runtime nvidia --gpus all \
-    --env "HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>" \
+    --env "HF_TOKEN=<SOMETHING>" \
     --env "LMCACHE_USE_EXPERIMENTAL=True" \
     --env "chunk_size=256" \
     --env "local_cpu=True" \

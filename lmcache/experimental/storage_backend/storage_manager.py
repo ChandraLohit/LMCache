@@ -14,6 +14,7 @@
 
 import asyncio
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import (TYPE_CHECKING, Dict, Generator, List, Optional, Sequence,
@@ -33,6 +34,7 @@ from lmcache.experimental.storage_backend.abstract_backend import \
 from lmcache.experimental.storage_backend.local_cpu_backend import \
     LocalCPUBackend
 from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 
 if TYPE_CHECKING:
@@ -81,6 +83,11 @@ class StorageManager:
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.worker_id = metadata.worker_id
+        
+        # Stats tracking
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.l1_misses_l2_hits = 0
+        self.total_requests = 0
 
         self.stream = torch.cuda.Stream()
 
@@ -165,6 +172,9 @@ class StorageManager:
         """
         Blocking function to get the memory object from the storages.
         """
+        start_time = time.time()
+        self.total_requests += 1
+        
         # Search in prefetch task
         self.manager_lock.acquire()
         prefetch_task = self.prefetch_tasks.get(key, None)
@@ -181,19 +191,37 @@ class StorageManager:
             # Tune the timeout for better performance
             prefetch_task.result(timeout=1)
 
-        # Search all backends for blocking get
+        # Check if we have the key in L1 cache first
+        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+        l1_memory_obj = local_cpu_backend.get_blocking(key)
+        if l1_memory_obj is not None:
+            # Found in L1, return it directly
+            return l1_memory_obj
+            
+        # Not found in L1, search other backends (L2)
         for backend_name, backend in self.storage_backends.items():
+            if backend_name == "LocalCPUBackend":
+                # Already checked L1
+                continue
 
-            # NOTE(Jiayi): bypass the allocator for now
             memory_obj = backend.get_blocking(key)
             if memory_obj is not None:
-                if backend_name != "LocalCPUBackend":
-                    local_cpu_backend = self.storage_backends[
-                        "LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.write_back(key, memory_obj)
+                # Found in L2 but not in L1
+                self.l1_misses_l2_hits += 1
+                
+                # Calculate timing and log it
+                time_ms = (time.time() - start_time) * 1000
+                data_size = memory_obj.get_size()
+                logger.info(f"L1 CACHE MISS + L2 CACHE HIT: key={key.to_string()}, " +
+                           f"size={data_size} bytes, time={time_ms:.2f}ms")
+                
+                # Write back to L1 cache
+                assert isinstance(local_cpu_backend, LocalCPUBackend)
+                local_cpu_backend.write_back(key, memory_obj)
                 return memory_obj
 
+        # Not found in any cache layer
+        logger.debug(f"CACHE MISS (all layers): key={key.to_string()}")
         return None
 
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
@@ -411,6 +439,18 @@ class StorageManager:
         return num_cleared
 
     def close(self):
+        # Log cache hierarchy stats if they've been collected
+        if hasattr(self, 'total_requests') and hasattr(self, 'l1_misses_l2_hits'):
+            l1_miss_rate = 0 if self.total_requests == 0 else \
+                self.l1_misses_l2_hits / self.total_requests
+            l2_promotion_rate = 0 if self.total_requests == 0 else \
+                self.l1_misses_l2_hits / self.total_requests
+                
+            logger.info(f"CACHE HIERARCHY STATS: total_requests={self.total_requests}, " + 
+                       f"l1_misses_l2_hits={self.l1_misses_l2_hits}, " +
+                       f"l1_miss_rate={l1_miss_rate:.2%}, l2_promotion_rate={l2_promotion_rate:.2%}")
+
+        # Close all backends
         for backend in self.storage_backends.values():
             backend.close()
 
@@ -455,6 +495,11 @@ class DistributedStorageManager:
         # allocators. Instead, we are using the NixlBackend's allocator for
         # zero-copy allocatations
         #self.allocator = allocator
+        
+        # Stats tracking (add for consistency with StorageManager)
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.l1_misses_l2_hits = 0
+        self.total_requests = 0
 
     def allocate(
         self,
@@ -513,6 +558,7 @@ class DistributedStorageManager:
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
+        self.total_requests += 1
         obj = self.storage_backend.get_blocking(key)
         return obj
 
@@ -548,4 +594,15 @@ class DistributedStorageManager:
         return self.storage_backend.contains(key)
 
     def close(self):
+        # Log cache hierarchy stats if they've been collected
+        if hasattr(self, 'total_requests') and hasattr(self, 'l1_misses_l2_hits'):
+            l1_miss_rate = 0 if self.total_requests == 0 else \
+                self.l1_misses_l2_hits / self.total_requests
+            l2_promotion_rate = 0 if self.total_requests == 0 else \
+                self.l1_misses_l2_hits / self.total_requests
+                
+            logger.info(f"CACHE HIERARCHY STATS: total_requests={self.total_requests}, " + 
+                      f"l1_misses_l2_hits={self.l1_misses_l2_hits}, " +
+                      f"l1_miss_rate={l1_miss_rate:.2%}, l2_promotion_rate={l2_promotion_rate:.2%}")
+                   
         self.storage_backend.close()
