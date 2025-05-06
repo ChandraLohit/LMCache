@@ -81,6 +81,7 @@ class MembrainConnector(RemoteBytesConnector):
             # Ensure result is not a coroutine
             assert not inspect.isawaitable(result)
             if result:
+                logger.info("CHEN WORKING ON MEMBRAIN HERE =====>")
                 logger.info(f"MEMBRAIN GET SUCCESS: key={hashed_key}, size={len(result)} bytes")
             else:
                 logger.info(f"MEMBRAIN GET FAILED: key={hashed_key} not found")
