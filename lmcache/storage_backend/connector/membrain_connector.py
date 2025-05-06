@@ -24,7 +24,7 @@ class MembrainConnector(RemoteBytesConnector):
         self.config = MembrainConfig(
             endpoint=endpoint,
             namespace=namespace,
-            timeout=30.0  # Reasonable default timeout
+            timeout=300.0  # Reasonable default timeout
         )
         # Initialize client
         self.client = MembrainClient(self.config)
@@ -62,7 +62,9 @@ class MembrainConnector(RemoteBytesConnector):
         try:
             # Use hashed key for Membrain
             hashed_key = self._hash_key(key)
+            logger.info(f"MEMBRAIN EXISTS: namespace={self.config.namespace}, key={hashed_key}")
             result = self.loop.run_until_complete(self.client.exists(hashed_key))
+            logger.info(f"MEMBRAIN EXISTS RESPONSE: {result} for key {hashed_key}")
             logger.debug(f"Key existence check for {key} (hash: {hashed_key}): {result}")
             return result
         except Exception as e:
@@ -74,9 +76,14 @@ class MembrainConnector(RemoteBytesConnector):
         try:
             # Use hashed key for Membrain
             hashed_key = self._hash_key(key)
+            logger.info(f"MEMBRAIN GET: namespace={self.config.namespace}, key={hashed_key}")
             result = self.loop.run_until_complete(self.client.get(hashed_key))
             # Ensure result is not a coroutine
             assert not inspect.isawaitable(result)
+            if result:
+                logger.info(f"MEMBRAIN GET SUCCESS: key={hashed_key}, size={len(result)} bytes")
+            else:
+                logger.info(f"MEMBRAIN GET FAILED: key={hashed_key} not found")
             logger.debug(f"Got value for key {key} (hash: {hashed_key}), size: {len(result) if result else 0} bytes")
             return result
         except MembrainKeyError:
@@ -92,8 +99,9 @@ class MembrainConnector(RemoteBytesConnector):
         try:
             # Use hashed key for Membrain
             hashed_key = self._hash_key(key)
-            logger.info(f"Membrain Put Key: {key} (hash: {hashed_key})")
-            self.loop.run_until_complete(self.client.put(hashed_key, obj))
+            logger.info(f"MEMBRAIN PUT: namespace={self.config.namespace}, key={hashed_key}, size={len(obj)} bytes")
+            response = self.loop.run_until_complete(self.client.put(hashed_key, obj))
+            logger.info(f"MEMBRAIN PUT RESPONSE: {response} for key {hashed_key}")
             logger.debug(f"Set value for key {key}, size: {len(obj)} bytes")
         except Exception as e:
             logger.error(f"Error setting key {key}: {e}")

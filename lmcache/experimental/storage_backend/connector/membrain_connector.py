@@ -49,7 +49,7 @@ class MembrainConnector(RemoteConnector):
         self.config = MembrainConfig(
             endpoint=endpoint,
             namespace=namespace,
-            timeout=30.0  # Reasonable default timeout
+            timeout=200.0  # Reasonable default timeout
         )
         self.client = MembrainClient(self.config)
         self.memory_allocator = memory_allocator
@@ -113,13 +113,15 @@ class MembrainConnector(RemoteConnector):
             kv_bytes_key = f"{hashed_key}_data"
             
             logger.debug(f"Getting key {original_key} (hash: {hashed_key})")
-            
+    
             # Get metadata first
             try:
+                logger.info(f"MEMBRAIN GET: namespace={self.config.namespace}, key={metadata_key}")
                 metadata_bytes = await self.client.get(metadata_key)
                 if not metadata_bytes:
-                    logger.debug(f"No metadata found for {hashed_key}")
+                    logger.info(f"MEMBRAIN GET FAILED: No metadata found for {hashed_key}")
                     return None
+                logger.info(f"MEMBRAIN GET SUCCESS: metadata for {hashed_key}, size={len(metadata_bytes)} bytes")
                     
                 # Deserialize metadata
                 redis_metadata = RedisMetadata.deserialize(memoryview(metadata_bytes))
@@ -136,11 +138,13 @@ class MembrainConnector(RemoteConnector):
                     return None
     
                 # Get actual KV cache data
+                logger.info(f"MEMBRAIN GET: namespace={self.config.namespace}, key={kv_bytes_key}")
                 kv_bytes = await self.client.get(kv_bytes_key)
                 
                 if kv_bytes is None:
-                    logger.warning(f"KV cache data missing for key: {original_key}")
+                    logger.warning(f"MEMBRAIN GET FAILED: KV cache data missing for key: {original_key}")
                     return None
+                logger.info(f"MEMBRAIN GET SUCCESS: data for {hashed_key}, size={len(kv_bytes)} bytes")
     
                 # Copy data into memory object
                 view = memoryview(memory_obj.byte_array)
@@ -180,7 +184,9 @@ class MembrainConnector(RemoteConnector):
 
             # Store metadata
             try:
-                await self.client.put(metadata_key, redis_metadata_bytes)
+                logger.info(f"MEMBRAIN PUT: namespace={self.config.namespace}, key={metadata_key}, size={len(redis_metadata_bytes)} bytes")
+                response = await self.client.put(metadata_key, redis_metadata_bytes)
+                logger.info(f"MEMBRAIN PUT RESPONSE: {response} for metadata key: {metadata_key}")
                 logger.debug(f"Stored metadata for key: {original_key}")
             except Exception as e:
                 logger.error(f"Error storing metadata for key {original_key}: {e}")
@@ -188,7 +194,9 @@ class MembrainConnector(RemoteConnector):
                 
             # Store KV bytes
             try:
-                await self.client.put(kv_bytes_key, kv_bytes)
+                logger.info(f"MEMBRAIN PUT: namespace={self.config.namespace}, key={kv_bytes_key}, size={len(kv_bytes)} bytes")
+                response = await self.client.put(kv_bytes_key, kv_bytes)
+                logger.info(f"MEMBRAIN PUT RESPONSE: {response} for data key: {kv_bytes_key}")
                 logger.debug(f"Stored {len(kv_bytes)} bytes for key: {original_key}")
             except Exception as e:
                 logger.error(f"Error storing KV bytes for key {original_key}: {e}")

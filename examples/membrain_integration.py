@@ -103,11 +103,12 @@ async def main():
             kv_transfer_config=ktc,
             max_model_len=4096,
             gpu_memory_utilization=0.8,
+            enable_prefix_caching=True,
             enforce_eager=True,
         )
         
         # Define prompts - using a longer prompt to show the benefit of caching
-        shared_prompt = "Hello, how are you? " * 50
+        shared_prompt = "Hello, how are you? " * 2
         prompt = shared_prompt + "Tell me about yourself."
         
         # Configure sampling parameters
