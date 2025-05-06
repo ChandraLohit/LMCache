@@ -7,6 +7,7 @@ from lmcache.logging import init_logger
 from lmcache.storage_backend.connector.base_connector import (
     RemoteConnector, RemoteConnectorDebugWrapper)
 from lmcache.storage_backend.connector.lm_connector import LMCServerConnector
+from lmcache.storage_backend.connector.membrain_connector import MembrainConnector
 from lmcache.storage_backend.connector.redis_connector import (
     RedisConnector, RedisSentinelConnector)
 
@@ -91,6 +92,16 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
             else:
                 raise ValueError(
                     f"LM connector only supports a single host, but got url:"
+                    f" {url}")
+                
+        case "membrain":
+            if num_hosts == 1:
+                host, port = parsed_url.hosts[0], parsed_url.ports[0]
+                endpoint = f"http://{host}:{port}"
+                connector = MembrainConnector(endpoint)
+            else:
+                raise ValueError(
+                    f"Membrain connector only supports a single host, but got url:"
                     f" {url}")
 
         case _:
