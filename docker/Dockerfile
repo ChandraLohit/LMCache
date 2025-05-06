@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 ARG LMCACHE_COMMIT_ID=1
 
-RUN git clone https://github.com/LMCache/LMCache.git
+RUN git clone https://github.com/prashant182/LMCache.git
 
 WORKDIR /workspace/LMCache
 RUN --mount=type=cache,target=/root/.cache/ccache \
@@ -80,23 +80,23 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
     python3 setup.py bdist_wheel --dist-dir=dist_lmcache
 
 #################### vLLM installation IMAGE ####################
-FROM vllm/vllm-openai:v0.7.3 AS vllm-openai
+FROM vllm/vllm-openai:latest AS vllm-openai
 RUN --mount=type=bind,from=build,src=/workspace/LMCache/dist_lmcache,target=/vllm-workspace/dist_lmcache \
 --mount=type=cache,target=/root/.cache/pip \
 pip install dist_lmcache/*.whl --verbose
 
 # Copy lmc_connector patch into vllm
-COPY patch/factory.py \
-    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
-COPY patch/lmcache_connector.py \
-    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
+# COPY patch/factory.py \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
+# COPY patch/lmcache_connector.py \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
 
 # Use diff if file is too large
-COPY patch/parallel_state.patch \
-    /usr/local/lib/python3.12/dist-packages/vllm/distributed/
+# COPY patch/parallel_state.patch \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/
 
-RUN patch /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py \
-    /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.patch
+#RUN patch /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py \
+#    /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.patch
 
 
 ENTRYPOINT ["vllm", "serve"]

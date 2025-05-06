@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, List, Optional
@@ -51,6 +52,11 @@ class LocalCPUBackend(StorageBackendInterface):
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        
+        # Stats tracking
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.evictions = 0
 
     def __str__(self):
         return self.__class__.__name__
@@ -73,6 +79,8 @@ class LocalCPUBackend(StorageBackendInterface):
         if not self.use_hot:
             return None
 
+        data_size = memory_obj.get_size()
+        start_time = time.time()
         with self.cpu_lock:
             if key in self.hot_cache:
                 old_memory_obj = self.hot_cache.pop(key)
@@ -80,7 +88,7 @@ class LocalCPUBackend(StorageBackendInterface):
             self.hot_cache[key] = memory_obj
             self.memory_allocator.ref_count_up(memory_obj)
 
-            self.usage += memory_obj.get_size()
+            self.usage += data_size
             self.stats_monitor.update_local_cache_usage(self.usage)
 
             # push kv admit msg
@@ -88,6 +96,10 @@ class LocalCPUBackend(StorageBackendInterface):
                 self.lmcache_worker.put_msg(
                     KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash,
                                "cpu"))
+                               
+        # Log the L1 cache operation
+        time_ms = (time.time() - start_time) * 1000
+        logger.info(f"L1 CACHE PUT: key={key.to_string()}, size={data_size} bytes, time={time_ms:.2f}ms, total_usage={self.usage} bytes")
         return None
 
     # NOTE (Jiayi): prefetch might be deprecated in the future.
@@ -102,15 +114,28 @@ class LocalCPUBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
+        start_time = time.time()
         with self.cpu_lock:
             if key not in self.hot_cache:
+                self.cache_misses += 1
+                logger.debug(f"L1 CACHE MISS (blocking): key={key.to_string()}")
                 return None
+                
             memory_obj = self.hot_cache[key]
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
             # ref count up themselves
             self.memory_allocator.ref_count_up(memory_obj)
             self.hot_cache.move_to_end(key)
+            
+            # Track cache hit
+            self.cache_hits += 1
+            
+            # Log the L1 cache hit
+            time_ms = (time.time() - start_time) * 1000
+            data_size = memory_obj.get_size()
+            logger.info(f"L1 CACHE HIT (blocking): key={key.to_string()}, size={data_size} bytes, time={time_ms:.2f}ms")
+            
             return memory_obj
 
     def remove(self, key: CacheEngineKey) -> bool:
@@ -120,8 +145,13 @@ class LocalCPUBackend(StorageBackendInterface):
             memory_obj = self.hot_cache.pop(key)
             self.memory_allocator.ref_count_down(memory_obj)
 
-            self.usage -= memory_obj.get_size()
+            data_size = memory_obj.get_size()
+            self.usage -= data_size
             self.stats_monitor.update_local_cache_usage(self.usage)
+            
+            # Track eviction
+            self.evictions += 1
+            logger.debug(f"L1 CACHE EVICTION: key={key.to_string()}, size={data_size} bytes, remaining_usage={self.usage} bytes")
 
             if self.lmcache_worker is not None:
                 self.lmcache_worker.put_msg(
@@ -258,4 +288,11 @@ class LocalCPUBackend(StorageBackendInterface):
         return len(clear_keys)
 
     def close(self) -> None:
+        # Log final cache stats before closing
+        hit_rate = 0 if (self.cache_hits + self.cache_misses) == 0 else \
+            self.cache_hits / (self.cache_hits + self.cache_misses)
+        
+        logger.info(f"L1 CACHE STATS: hits={self.cache_hits}, misses={self.cache_misses}, " + 
+                   f"hit_rate={hit_rate:.2%}, evictions={self.evictions}, total_usage={self.usage} bytes")
+        
         self.clear()
