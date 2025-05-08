@@ -19,7 +19,7 @@ import time
 from typing import List, Optional, no_type_check, Dict
 
 from lmcache.experimental.memory_management import MemoryAllocatorInterface, MemoryObj
-from lmcache.experimental.protocol import RedisMetadata  # Reusing Redis metadata format
+from lmcache.experimental.protocol import RemoteMetadata  # Reusing Redis metadata format
 from lmcache.experimental.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
@@ -136,7 +136,7 @@ class MembrainConnector(RemoteConnector):
                 logger.info(f"MEMBRAIN GET SUCCESS: metadata for {hashed_key}, size={len(metadata_bytes)} bytes, time={metadata_time_ms:.2f}ms")
                     
                 # Deserialize metadata
-                redis_metadata = RedisMetadata.deserialize(memoryview(metadata_bytes))
+                redis_metadata = RemoteMetadata.deserialize(memoryview(metadata_bytes))
                 
                 # Allocate memory object
                 memory_obj = self.memory_allocator.allocate(
@@ -208,7 +208,7 @@ class MembrainConnector(RemoteConnector):
             memory_format = memory_obj.get_memory_format()
 
             # Create and serialize metadata
-            redis_metadata_bytes = RedisMetadata(
+            redis_metadata_bytes = RemoteMetadata(
                 len(kv_bytes), kv_shape, kv_dtype, memory_format).serialize()
 
             # Store metadata
