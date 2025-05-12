@@ -51,7 +51,7 @@ class MembrainConnector(RemoteConnector):
         self.config = MembrainConfig(
             endpoint=endpoint,
             namespace=namespace,
-            timeout=200.0  # Reasonable default timeout
+            timeout=25.0  # Reasonable default timeout
         )
         self.client = MembrainClient(self.config)
         self.memory_allocator = memory_allocator

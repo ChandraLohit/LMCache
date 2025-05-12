@@ -239,6 +239,43 @@ class MembrainClient:
             await self._session.close()
             self._session = None
 
+    async def reset(self, timeout: Optional[float] = None) -> None:
+        """Reset the Membrain cluster.
+        
+        This resets the entire cluster state using the supernova API.
+        
+        Args:
+            timeout: Optional operation timeout in seconds
+            
+        Raises:
+            MembrainError: If the reset operation fails
+        """
+        if self._closed:
+            raise MembrainError("Client is closed")
+
+        timeout = timeout or self._config.timeout
+        url = urljoin(self._config.endpoint, "/api/supernova/v1/cluster/reset")
+
+        for attempt in range(self._config.max_retries):
+            try:
+                await self._ensure_session()
+                async with self._session.request(
+                    method='POST',
+                    url=url,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    if response.status != 200:
+                        raise MembrainError(f"Reset cluster failed with HTTP {response.status}: {await response.text()}")
+                    logger.info("Cluster reset successfully")
+                    return
+
+            except asyncio.TimeoutError:
+                raise MembrainTimeoutError(f"Reset operation timed out after {timeout}s")
+            except aiohttp.ClientError as e:
+                if attempt == self._config.max_retries - 1:
+                    raise MembrainConnectionError(f"Reset operation connection failed: {e}")
+                await asyncio.sleep(self._config.retry_delay * (2 ** attempt))
+
     async def __aenter__(self) -> 'MembrainClient':
         """Async context manager entry."""
         return self
