@@ -25,6 +25,8 @@ from lmcache.experimental.storage_backend.connector.lm_connector import \
     LMCServerConnector
 from lmcache.experimental.storage_backend.connector.membrain_connector import \
     MembrainConnector
+from lmcache.experimental.storage_backend.connector.membrain_connector_v2 import \
+    MembrainConnectorV2
 from lmcache.experimental.storage_backend.connector.redis_connector import (
     RedisConnector, RedisSentinelConnector)
 from lmcache.logging import init_logger
@@ -167,8 +169,16 @@ def CreateConnector(
                 host, port = parsed_url.hosts[0], parsed_url.ports[0]
                 endpoint = f"http://{host}:{port}"
                 namespace = parsed_url.query_params[0].get("namespace", "lmcache")
-                connector = MembrainConnector(endpoint, namespace, loop, 
-                                             memory_allocator)
+                
+                # Check environment variable to determine which connector to use
+                use_v2 = os.environ.get("USE_MEMBRAIN_V2", "").lower() in ("1", "true", "yes", "on")
+                
+                if use_v2:
+                    logger.info(f"Using MembrainConnectorV2 for {endpoint} (namespace: {namespace})")
+                    connector = MembrainConnectorV2(endpoint, namespace, loop, memory_allocator)
+                else:
+                    logger.info(f"Using standard MembrainConnector for {endpoint} (namespace: {namespace})")
+                    connector = MembrainConnector(endpoint, namespace, loop, memory_allocator)
             else:
                 raise ValueError(
                     f"Membrain connector only supports a single host, but got url:"

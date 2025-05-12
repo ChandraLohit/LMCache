@@ -75,6 +75,7 @@ ARG LMCACHE_COMMIT_ID=1
 RUN git clone https://github.com/prashant182/LMCache.git
 
 WORKDIR /workspace/LMCache
+RUN git checkout memb
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/root/.cache/pip \
     python3 setup.py bdist_wheel --dist-dir=dist_lmcache
