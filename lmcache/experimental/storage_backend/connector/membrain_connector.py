@@ -120,73 +120,98 @@ class MembrainConnector(RemoteConnector):
             hashed_key = self._hash_key(original_key)
             metadata_key = f"{hashed_key}_meta"
             kv_bytes_key = f"{hashed_key}_data"
-            
+
             logger.debug(f"Getting key {original_key} (hash: {hashed_key})")
-    
+
             # Get metadata first
             try:
                 metadata_start = time.time()
                 logger.info(f"MEMBRAIN GET: namespace={self.config.namespace}, key={metadata_key}")
-                metadata_bytes = await self.client.get(metadata_key)
+
+                try:
+                    metadata_bytes = await self.client.get(metadata_key)
+                except MembrainKeyError:
+                    # Key not found - this is an expected case for cache misses
+                    self.cache_misses += 1
+                    logger.info(f"MEMBRAIN CACHE MISS: No metadata found for {hashed_key}")
+                    return None
+
                 if not metadata_bytes:
                     self.cache_misses += 1
-                    logger.info(f"MEMBRAIN GET FAILED: No metadata found for {hashed_key}")
+                    logger.info(f"MEMBRAIN GET FAILED: Empty metadata for {hashed_key}")
                     return None
+
                 metadata_time_ms = (time.time() - metadata_start) * 1000
                 logger.info(f"MEMBRAIN GET SUCCESS: metadata for {hashed_key}, size={len(metadata_bytes)} bytes, time={metadata_time_ms:.2f}ms")
-                    
+
                 # Deserialize metadata
                 redis_metadata = RemoteMetadata.deserialize(memoryview(metadata_bytes))
-                
+
                 # Allocate memory object
                 memory_obj = self.memory_allocator.allocate(
                     redis_metadata.shape,
                     redis_metadata.dtype,
                     redis_metadata.fmt,
                 )
-                
+
                 if memory_obj is None:
                     self.cache_misses += 1
                     logger.warning(f"Failed to allocate memory for key: {original_key}")
                     return None
-    
+
                 # Get actual KV cache data
                 data_start = time.time()
                 logger.info(f"MEMBRAIN GET: namespace={self.config.namespace}, key={kv_bytes_key}")
-                kv_bytes = await self.client.get(kv_bytes_key)
-                
+
+                try:
+                    kv_bytes = await self.client.get(kv_bytes_key)
+                except MembrainKeyError:
+                    # Data key not found - this is unexpected if metadata exists
+                    self.cache_misses += 1
+                    logger.warning(f"MEMBRAIN INCONSISTENT STATE: Metadata exists but data missing for {original_key}")
+                    # Free the previously allocated memory to prevent leaks
+                    self.memory_allocator.ref_count_down(memory_obj)
+                    return None
+
                 if kv_bytes is None:
                     self.cache_misses += 1
-                    logger.warning(f"MEMBRAIN GET FAILED: KV cache data missing for key: {original_key}")
+                    logger.warning(f"MEMBRAIN GET FAILED: KV cache data is None for key: {original_key}")
+                    # Free the previously allocated memory to prevent leaks
+                    self.memory_allocator.ref_count_down(memory_obj)
                     return None
-                
+
                 data_size = len(kv_bytes)
                 self.total_bytes_get += data_size
                 data_time_ms = (time.time() - data_start) * 1000
                 logger.info(f"MEMBRAIN GET SUCCESS: data for {hashed_key}, size={data_size} bytes, time={data_time_ms:.2f}ms")
-    
+
                 # Copy data into memory object
                 view = memoryview(memory_obj.byte_array)
                 view[:redis_metadata.length] = kv_bytes
-                
+
                 # Track cache hit
                 self.cache_hits += 1
-                
+
                 # Overall timing
                 total_time_ms = (time.time() - start_time) * 1000
                 self.stats_monitor.update_interval_remote_time_to_get(total_time_ms)
                 logger.info(f"L2 CACHE HIT: key={original_key}, size={data_size} bytes, total_time={total_time_ms:.2f}ms")
-                
+
                 return memory_obj
-                
+
+            except MembrainError as e:
+                # Handle other Membrain-specific errors
+                self.cache_misses += 1
+                logger.error(f"Membrain-specific error retrieving key {original_key}: {e}")
+                return None
             except Exception as e:
                 self.cache_misses += 1
-                logger.error(f"Error retrieving key {original_key}: {e}")
+                logger.error(f"Unexpected error retrieving key {original_key}: {e}", exc_info=True)
                 return None
-                
+
         except Exception as e:
             self.cache_misses += 1
-            logger.error(f"Unexpected error getting key {key.to_string()}: {e}")
+            logger.error(f"Unexpected error getting key {key.to_string()}: {e}", exc_info=True)
             return None
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
@@ -257,17 +282,24 @@ class MembrainConnector(RemoteConnector):
         return []
 
     async def close(self):
-        """Close the Membrain client."""
+        """Close the Membrain client with proper timeout handling."""
         try:
             # Log final cache stats before closing
             hit_rate = 0 if (self.cache_hits + self.cache_misses) == 0 else \
                 self.cache_hits / (self.cache_hits + self.cache_misses)
-            
-            logger.info(f"L2 CACHE STATS: hits={self.cache_hits}, misses={self.cache_misses}, " + 
+
+            logger.info(f"L2 CACHE STATS: hits={self.cache_hits}, misses={self.cache_misses}, " +
                        f"hit_rate={hit_rate:.2%}, bytes_get={self.total_bytes_get}, " +
                        f"bytes_put={self.total_bytes_put}")
-            
-            await self.client.close()
-            logger.info("Closed experimental Membrain connector")
+
+            # Use asyncio.wait_for to ensure client close doesn't hang indefinitely
+            try:
+                # Default timeout of 5 seconds for closing operations
+                await asyncio.wait_for(self.client.close(), timeout=5.0)
+                logger.info("Closed experimental Membrain connector")
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while closing Membrain connector - resources may not be fully released")
+            except Exception as e:
+                logger.error(f"Error during Membrain client close operation: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"Error closing Membrain connector: {e}")
+            logger.error(f"Error closing Membrain connector: {e}", exc_info=True)

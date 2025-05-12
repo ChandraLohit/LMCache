@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import abc
+import time
 from typing import List, Optional, Tuple
 
 import torch
 
 import lmcache.c_ops as lmc_ops
-from lmcache.experimental.memory_management import (  # noqa: E501
-    GPUMemoryAllocator, MemoryFormat, MemoryObj)
+from lmcache.experimental.memory_management import MemoryFormat, MemoryObj
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 
@@ -394,12 +394,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
 
-        Note: 
+        Note:
           1. This function expects the 'slot_mapping' is a "full slot mapping"
              where it's length is the same as the whole token sequence.
           2. In the case that there is prefix caching, slot_mapping will starts
              with -1s until the end of the matched prefix. The start and end
-             should NEVER overlap with the prefix caching (which means the 
+             should NEVER overlap with the prefix caching (which means the
              underlying CUDA kernel will never see -1 in slot_mapping)
 
         :raises ValueError: If 'kvcaches' is not provided in kwargs,
@@ -417,19 +417,27 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        #if not self.pointers_initialized:
+        # Ensure pointers are initialized correctly
         if not self._pointers_are_good(kvcaches):
             self._initialize_pointers(kvcaches)
 
+        # Track operation start time for logging
+        start_time = time.perf_counter()
+
         if self.gpu_buffer is None or \
                 end - start != self.gpu_buffer.shape[2]:
+            # Direct path: KV cache -> memory_obj.tensor
             lmc_ops.multi_layer_kv_transfer(memory_obj.tensor,
                                             self.kv_cache_pointers,
                                             slot_mapping[start:end],
                                             kvcaches[0].device,
                                             self.page_buffer_size, True)
+            # We need to ensure synchronization if the tensor is not on a CUDA device
+            # This is because multi_layer_kv_transfer may launch asynchronous operations
+            if not memory_obj.tensor.is_cuda:
+                torch.cuda.current_stream().synchronize()
         else:
-            # kvcaches -> gpu_buffer -> memobj
+            # Buffered path: KV cache -> gpu_buffer -> memory_obj.tensor
             assert self.gpu_buffer.device == kvcaches[0].device
             tmp_gpu_buffer = self.gpu_buffer[:, :, :end - start, :]
             lmc_ops.multi_layer_kv_transfer(tmp_gpu_buffer,
@@ -437,13 +445,19 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                                             slot_mapping[start:end],
                                             kvcaches[0].device,
                                             self.page_buffer_size, True)
+
+            # Copy to memory_obj - whether this is asynchronous depends on devices
             memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            torch.cuda.synchronize()
+            # Always synchronize after memory_obj.tensor.copy_ when using the buffer path
+            # This ensures the copy completes before returning, preventing race conditions
+            torch.cuda.current_stream().synchronize()
+
+        # Log transfer time for performance monitoring
+        transfer_time_ms = (time.perf_counter() - start_time) * 1000
+        logger.debug(f"KV transfer from GPU took {transfer_time_ms:.2f}ms")
+
+        memory_obj.metadata.fmt = MemoryFormat.KV_BLOB
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size(
