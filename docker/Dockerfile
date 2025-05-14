@@ -33,6 +33,10 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 # or future versions of triton.
 RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
+RUN pip install --no-cache-dir \
+    boto3 \
+    aws-embedded-metrics==3.0.0
+
 WORKDIR /workspace
 
 # install build and runtime dependencies
