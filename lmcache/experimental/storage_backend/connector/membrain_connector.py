@@ -25,6 +25,9 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.observability import LMCStatsMonitor
 
+# TEMP: TEMP CW LOGGER
+from lmcache.experimental.storage_backend.connector.cloudwatch_publisher import CloudWatchMetricsPublisher
+
 # Import the Membrain client
 from lmcache.clients.membrain_client import MembrainClient, MembrainConfig, MembrainError, MembrainKeyError
 
@@ -64,6 +67,10 @@ class MembrainConnector(RemoteConnector):
         self.cache_misses = 0
         self.total_bytes_get = 0
         self.total_bytes_put = 0
+
+        # TEMP: Initialize CloudWatch metrics publisher
+        self.metrics_publisher = CloudWatchMetricsPublisher(namespace="LMCache-Membrain")
+
         logger.info(f"Initialized experimental Membrain connector with endpoint {endpoint}, namespace {namespace}")
         
     def _hash_key(self, key_str: str) -> str:
@@ -131,6 +138,7 @@ class MembrainConnector(RemoteConnector):
                 if not metadata_bytes:
                     self.cache_misses += 1
                     logger.info(f"MEMBRAIN GET FAILED: No metadata found for {hashed_key}")
+                    self.metrics_publisher.add_metric("CacheGetMiss", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
                     return None
                 metadata_time_ms = (time.time() - metadata_start) * 1000
                 logger.info(f"MEMBRAIN GET SUCCESS: metadata for {hashed_key}, size={len(metadata_bytes)} bytes, time={metadata_time_ms:.2f}ms")
@@ -148,6 +156,7 @@ class MembrainConnector(RemoteConnector):
                 if memory_obj is None:
                     self.cache_misses += 1
                     logger.warning(f"Failed to allocate memory for key: {original_key}")
+                    self.metrics_publisher.add_metric("CacheGetMiss", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
                     return None
     
                 # Get actual KV cache data
@@ -158,6 +167,7 @@ class MembrainConnector(RemoteConnector):
                 if kv_bytes is None:
                     self.cache_misses += 1
                     logger.warning(f"MEMBRAIN GET FAILED: KV cache data missing for key: {original_key}")
+                    self.metrics_publisher.add_metric("CacheGetMiss", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
                     return None
                 
                 data_size = len(kv_bytes)
@@ -176,17 +186,20 @@ class MembrainConnector(RemoteConnector):
                 total_time_ms = (time.time() - start_time) * 1000
                 self.stats_monitor.update_interval_remote_time_to_get(total_time_ms)
                 logger.info(f"L2 CACHE HIT: key={original_key}, size={data_size} bytes, total_time={total_time_ms:.2f}ms")
+                self.metrics_publisher.add_metric("CacheGetHit", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
                 
                 return memory_obj
                 
             except Exception as e:
                 self.cache_misses += 1
                 logger.error(f"Error retrieving key {original_key}: {e}")
+                self.metrics_publisher.add_metric("CacheGetError", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
                 return None
                 
         except Exception as e:
             self.cache_misses += 1
             logger.error(f"Unexpected error getting key {key.to_string()}: {e}")
+            self.metrics_publisher.add_metric("CacheGetError", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "GET"})
             return None
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
@@ -221,6 +234,7 @@ class MembrainConnector(RemoteConnector):
                 logger.info(f"MEMBRAIN PUT RESPONSE: {response} for metadata key: {metadata_key}, time={metadata_time_ms:.2f}ms")
             except Exception as e:
                 logger.error(f"Error storing metadata for key {original_key}: {e}")
+                self.metrics_publisher.add_metric("CachePutError", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "PUT"})
                 return
                 
             # Store KV bytes
@@ -234,12 +248,14 @@ class MembrainConnector(RemoteConnector):
                 logger.info(f"MEMBRAIN PUT RESPONSE: {response} for data key: {kv_bytes_key}, time={data_time_ms:.2f}ms")
             except Exception as e:
                 logger.error(f"Error storing KV bytes for key {original_key}: {e}")
+                self.metrics_publisher.add_metric("CachePutError", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "PUT"})
                 return
 
             # Overall timing
             total_time_ms = (time.time() - start_time) * 1000
             self.stats_monitor.update_interval_remote_time_to_put(total_time_ms)
             logger.info(f"L2 CACHE PUT: key={original_key}, size={data_size} bytes, total_time={total_time_ms:.2f}ms")
+            self.metrics_publisher.add_metric("CachePut", 1, dimensions={"CacheLevel": "L2", "Operation": "PUT"})
 
             # Update remote cache usage stats
             self.stats_monitor.update_interval_remote_write_metrics(data_size + metadata_size)
@@ -249,6 +265,7 @@ class MembrainConnector(RemoteConnector):
             
         except Exception as e:
             logger.error(f"Error putting key {key.to_string()}: {e}")
+            self.metrics_publisher.add_metric("CachePutError", 1, dimensions={"CacheLevel": "MEMBRAIN", "Operation": "PUT"})
 
     @no_type_check
     async def list(self) -> List[str]:
