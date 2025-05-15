@@ -33,10 +33,6 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 # or future versions of triton.
 RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
-RUN pip install --no-cache-dir \
-    boto3 \
-    aws-embedded-metrics==3.0.0
-
 WORKDIR /workspace
 
 # install build and runtime dependencies
@@ -86,6 +82,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 #################### vLLM installation IMAGE ####################
 FROM vllm/vllm-openai:latest AS vllm-openai
+ENV MAX_JOBS=10
+RUN pip install --no-cache-dir \
+    boto3 \
+    aws-embedded-metrics
 RUN --mount=type=bind,from=build,src=/workspace/LMCache/dist_lmcache,target=/vllm-workspace/dist_lmcache \
 --mount=type=cache,target=/root/.cache/pip \
 pip install dist_lmcache/*.whl --verbose
