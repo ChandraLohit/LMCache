@@ -257,12 +257,11 @@ class MembrainConnector(RemoteConnector):
             total_time_ms = (time.time() - start_time) * 1000
             self.stats_monitor.update_interval_remote_time_to_put(total_time_ms)
             logger.info(f"L2 CACHE PUT: key={original_key}, size={data_size} bytes, total_time={total_time_ms:.2f}ms")
-            self.metrics_publisher.add_metric("CachePut", 1, dimensions={"CacheLevel": "L2", "Operation": "PUT"})
 
             # Emit cache put metrics
             total_size = data_size + metadata_size
-            await emit_cache_bytes("L2", "PUT", total_size)
-            await emit_cache_latency("L2", "PUT", total_time_ms)
+            await emit_cache_bytes("MEMBRAIN", "PUT", total_size)
+            await emit_cache_latency("MEMBRAIN", "PUT", total_time_ms)
 
             # Update remote cache usage stats
             self.stats_monitor.update_interval_remote_write_metrics(data_size + metadata_size)
