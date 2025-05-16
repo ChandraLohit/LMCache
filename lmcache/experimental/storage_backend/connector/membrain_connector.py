@@ -178,8 +178,8 @@ class MembrainConnector(RemoteConnector):
                 # Copy data into memory object
                 lvalue = memoryview(memory_obj.byte_array)
                 rvalue = memoryview(kv_bytes) if not isinstance(kv_bytes, memoryview) else kv_bytes
-                logger.debug(f"Main Byte Array format: {lvalue.format}, itemsize: {lvalue.itemsize}, shape: {lvalue.shape}")
-                logger.debug(f"Retrieved Byte Array format: {rvalue.format}, itemsize: {rvalue.itemsize}, shape: {rvalue.shape}")
+                logger.info(f"Main Byte Array format: {lvalue.format}, itemsize: {lvalue.itemsize}, shape: {lvalue.shape}")
+                logger.info(f"Retrieved Byte Array format: {rvalue.format}, itemsize: {rvalue.itemsize}, shape: {rvalue.shape}")
 
                 view = memoryview(memory_obj.byte_array)
                 view[:redis_metadata.length] = kv_bytes
