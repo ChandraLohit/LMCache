@@ -176,6 +176,11 @@ class MembrainConnector(RemoteConnector):
                 logger.info(f"MEMBRAIN GET SUCCESS: data for {hashed_key}, size={data_size} bytes, time={data_time_ms:.2f}ms")
     
                 # Copy data into memory object
+                lvalue = memoryview(memory_obj.byte_array)
+                rvalue = memoryview(kv_bytes) if not isinstance(kv_bytes, memoryview) else kv_bytes
+                logger.debug(f"Main Byte Array format: {lvalue.format}, itemsize: {lvalue.itemsize}, shape: {lvalue.shape}")
+                logger.debug(f"Retrieved Byte Array format: {rvalue.format}, itemsize: {rvalue.itemsize}, shape: {rvalue.shape}")
+
                 view = memoryview(memory_obj.byte_array)
                 view[:redis_metadata.length] = kv_bytes
                 
