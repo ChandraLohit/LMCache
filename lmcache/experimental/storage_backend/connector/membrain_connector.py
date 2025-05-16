@@ -145,6 +145,7 @@ class MembrainConnector(RemoteConnector):
                     
                 # Deserialize metadata
                 redis_metadata = RemoteMetadata.deserialize(memoryview(metadata_bytes))
+                logger.info(f"METADATA for {hashed_key}'s LENGTH IS {redis_metadata.length}")
                 
                 # Allocate memory object
                 memory_obj = self.memory_allocator.allocate(
