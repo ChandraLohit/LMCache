@@ -60,7 +60,7 @@ FROM base AS build
 COPY requirements-build.txt requirements-build.txt
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=2
+ARG max_jobs=16
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
 ARG nvcc_threads=8
@@ -81,6 +81,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
     python3 setup.py bdist_wheel --dist-dir=dist_lmcache
 
 #################### vLLM installation IMAGE ####################
+# vllm 0.8.5.post1 was benchmarked
 FROM vllm/vllm-openai:latest AS vllm-openai
 ENV MAX_JOBS=10
 RUN pip install --no-cache-dir \
