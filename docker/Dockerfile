@@ -60,10 +60,10 @@ FROM base AS build
 COPY requirements-build.txt requirements-build.txt
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=16
+ARG max_jobs=32
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
-ARG nvcc_threads=8
+ARG nvcc_threads=16
 ENV NVCC_THREADS=$nvcc_threads
 
 
@@ -72,7 +72,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 ARG LMCACHE_COMMIT_ID=1
 
-RUN git clone https://github.com/prashant182/LMCache.git
 RUN git clone https://github.com/prashant182/LMCache.git
 
 WORKDIR /workspace/LMCache
@@ -83,7 +82,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 #################### vLLM installation IMAGE ####################
 # vllm 0.8.5.post1 was benchmarked
-FROM vllm/vllm-openai:latest AS vllm-openai
+FROM vllm/vllm-openai:v0.8.5.post1 AS vllm-openai
 ENV MAX_JOBS=10
 RUN pip install --no-cache-dir \
     boto3 \
