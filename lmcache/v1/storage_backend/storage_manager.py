@@ -12,13 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-<<<<<<< HEAD:lmcache/experimental/storage_backend/storage_manager.py
 import asyncio
 import threading
 import time
-=======
-# Standard
->>>>>>> upstream/dev:lmcache/v1/storage_backend/storage_manager.py
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import (
@@ -225,7 +221,6 @@ class StorageManager:
             
         # Not found in L1, search other backends (L2)
         for backend_name, backend in self.storage_backends.items():
-<<<<<<< HEAD:lmcache/experimental/storage_backend/storage_manager.py
             if backend_name == "LocalCPUBackend":
                 # Already checked L1
                 continue
@@ -244,15 +239,6 @@ class StorageManager:
                 # Write back to L1 cache
                 assert isinstance(local_cpu_backend, LocalCPUBackend)
                 local_cpu_backend.write_back(key, memory_obj)
-=======
-            # NOTE(Jiayi): bypass the allocator for now
-            memory_obj = backend.get_blocking(key)
-            if memory_obj is not None:
-                if backend_name != "LocalCPUBackend":
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.write_back(key, memory_obj)
->>>>>>> upstream/dev:lmcache/v1/storage_backend/storage_manager.py
                 return memory_obj
 
         # Not found in any cache layer
@@ -524,16 +510,12 @@ class DistributedStorageManager:
         # TODO, HACK: we are not using the AdHocMemoryAllocator or other passed
         # allocators. Instead, we are using the NixlBackend's allocator for
         # zero-copy allocatations
-<<<<<<< HEAD:lmcache/experimental/storage_backend/storage_manager.py
         #self.allocator = allocator
         
         # Stats tracking (add for consistency with StorageManager)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.l1_misses_l2_hits = 0
         self.total_requests = 0
-=======
-        # self.allocator = allocator
->>>>>>> upstream/dev:lmcache/v1/storage_backend/storage_manager.py
 
     def allocate(
         self,

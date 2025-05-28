@@ -60,15 +60,11 @@ class LocalCPUBackend(StorageBackendInterface):
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
-<<<<<<< HEAD:lmcache/experimental/storage_backend/local_cpu_backend.py
         
         # Stats tracking
         self.cache_hits = 0
         self.cache_misses = 0
         self.evictions = 0
-=======
-        self.layerwise = layerwise
->>>>>>> upstream/dev:lmcache/v1/storage_backend/local_cpu_backend.py
 
     def __str__(self):
         return self.__class__.__name__
@@ -111,17 +107,12 @@ class LocalCPUBackend(StorageBackendInterface):
             # push kv admit msg
             if self.lmcache_worker is not None:
                 self.lmcache_worker.put_msg(
-<<<<<<< HEAD:lmcache/experimental/storage_backend/local_cpu_backend.py
                     KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash,
                                "cpu"))
                                
         # Log the L1 cache operation
         time_ms = (time.time() - start_time) * 1000
         logger.info(f"L1 CACHE PUT: key={key.to_string()}, size={data_size} bytes, time={time_ms:.2f}ms, total_usage={self.usage} bytes")
-=======
-                    KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "cpu")
-                )
->>>>>>> upstream/dev:lmcache/v1/storage_backend/local_cpu_backend.py
         return None
 
     # NOTE (Jiayi): prefetch might be deprecated in the future.
