@@ -12,34 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-<<<<<<< HEAD:lmcache/experimental/storage_backend/connector/__init__.py
 import asyncio
 import re
 import os
-=======
-# Standard
->>>>>>> upstream/dev:lmcache/v1/storage_backend/connector/__init__.py
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import asyncio
 import re
 
-<<<<<<< HEAD:lmcache/experimental/storage_backend/connector/__init__.py
-from lmcache.experimental.config import LMCacheEngineConfig
-from lmcache.experimental.memory_management import MemoryAllocatorInterface
-from lmcache.experimental.storage_backend.connector.base_connector import \
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryAllocatorInterface
+from lmcache.v1.storage_backend.connector.base_connector import \
     RemoteConnector
-from lmcache.experimental.storage_backend.connector.lm_connector import \
+from lmcache.v1.storage_backend.connector.lm_connector import \
     LMCServerConnector
-from lmcache.experimental.storage_backend.connector.membrain_connector import \
+from lmcache.v1.storage_backend.connector.membrain_connector import \
     MembrainConnector
-from lmcache.experimental.storage_backend.connector.membrain_connector_v2 import \
+from lmcache.v1.storage_backend.connector.membrain_connector_v2 import \
     MembrainConnectorV2
-from lmcache.experimental.storage_backend.connector.redis_connector import (
+from lmcache.v1.storage_backend.connector.redis_connector import (
     RedisConnector, RedisSentinelConnector)
-=======
-# First Party
->>>>>>> upstream/dev:lmcache/v1/storage_backend/connector/__init__.py
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
@@ -189,7 +181,6 @@ def CreateConnector(
                 connector = LMCServerConnector(host, port, loop, local_cpu_backend)
             else:
                 raise ValueError(
-<<<<<<< HEAD:lmcache/experimental/storage_backend/connector/__init__.py
                     f"LM connector only supports a single host, but got url:"
                     f" {url}")
                 
@@ -213,10 +204,6 @@ def CreateConnector(
                     f"Membrain connector only supports a single host, but got url:"
                     f" {url}")
                 
-=======
-                    f"LM connector only supports a single host, but got url: {url}"
-                )
->>>>>>> upstream/dev:lmcache/v1/storage_backend/connector/__init__.py
         case "infinistore":
             host, port = parsed_url.hosts[0], parsed_url.ports[0]
             device_name = parsed_url.query_params[0].get("device", "mlx5_0")
@@ -261,8 +248,4 @@ def CreateConnector(
             raise ValueError(f"Unknown connector type {connector_type} (url is: {url})")
 
     logger.info(f"Created connector {connector} for {connector_type}")
-<<<<<<< HEAD:lmcache/experimental/storage_backend/connector/__init__.py
     return connector
-=======
-    return InstrumentedRemoteConnector(connector)
->>>>>>> upstream/dev:lmcache/v1/storage_backend/connector/__init__.py

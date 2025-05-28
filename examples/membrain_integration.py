@@ -21,7 +21,7 @@ from vllm.config import KVTransferConfig
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("lmcache").setLevel(logging.DEBUG)
 logging.getLogger("lmcache.storage_backend.connector.membrain_connector").setLevel(logging.DEBUG)
-logging.getLogger("lmcache.experimental.storage_backend").setLevel(logging.DEBUG)
+logging.getLogger("lmcache.v1.storage_backend").setLevel(logging.DEBUG)
 
 # Import Membrain client for checking keys
 from lmcache.clients.membrain_client import MembrainClient, MembrainConfig

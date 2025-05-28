@@ -18,15 +18,15 @@ import base64
 import time
 from typing import List, Optional, no_type_check, Dict
 
-from lmcache.experimental.memory_management import MemoryAllocatorInterface, MemoryObj
-from lmcache.experimental.protocol import RemoteMetadata  # Reusing Redis metadata format
-from lmcache.experimental.storage_backend.connector.base_connector import RemoteConnector
+from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
+from lmcache.v1.protocol import RemoteMetadata  # Reusing Redis metadata format
+from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.observability import LMCStatsMonitor
 
 # TEMP: TEMP CW LOGGER
-from lmcache.experimental.storage_backend.connector.cloudwatch_publisher import (
+from lmcache.v1.storage_backend.connector.cloudwatch_publisher import (
     emit_cache_hit, emit_cache_miss, emit_cache_error, 
     emit_cache_latency, emit_cache_bytes, emit_cache_hit_rate
 )

@@ -20,7 +20,7 @@ from vllm.config import KVTransferConfig
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("lmcache").setLevel(logging.DEBUG)
 logging.getLogger("lmcache.storage_backend.connector.redis_connector").setLevel(logging.DEBUG)
-logging.getLogger("lmcache.experimental.storage_backend").setLevel(logging.DEBUG)
+logging.getLogger("lmcache.v1.storage_backend").setLevel(logging.DEBUG)
 
 # Configure LMCache to use Redis backend
 os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"

@@ -2,8 +2,8 @@ import asyncio
 import time
 from typing import Dict, Optional
 
-from lmcache.experimental.memory_management import MemoryAllocatorInterface, MemoryObj
-from lmcache.experimental.storage_backend.connector.membrain_connector import MembrainConnector
+from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
+from lmcache.v1.storage_backend.connector.membrain_connector import MembrainConnector
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 

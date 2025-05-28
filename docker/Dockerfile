@@ -77,7 +77,7 @@ ARG vllm_fa_cmake_gpu_arches='80-real;90-real'
 ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
 #################### BASE BUILD IMAGE ####################
 #################### WHEEL BUILD IMAGE ####################
-# FROM base AS build
+FROM base AS build
 # install build dependencies
 COPY ./requirements/build.txt build.txt
 # max jobs used by Ninja to build extensions
