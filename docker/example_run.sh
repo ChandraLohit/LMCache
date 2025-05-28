@@ -7,8 +7,6 @@ docker run --runtime nvidia --gpus all \
     --env "max_local_cpu_size=5" \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --network host \
-    --entrypoint "/usr/local/bin/vllm" \
     $IMAGE \
-    serve mistralai/Mistral-7B-Instruct-v0.2 --kv-transfer-config \
-    '{"kv_connector":"LMCacheConnector","kv_role":"kv_both"}' \
-    --enable-chunked-prefill false
+    $HF_MODEL_NAME --kv-transfer-config \
+    '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'

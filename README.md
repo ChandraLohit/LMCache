@@ -4,25 +4,20 @@
 </div>
 
 <p align="center">
+  <a href="https://deepwiki.com/LMCache/LMCache">
+    <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+  </a>
   <a href="https://docs.lmcache.ai/">
     <img alt="Documentation" src="https://img.shields.io/badge/docs-blue?logo=readthedocs&logoColor=f0f8ff">
   </a>
-  
   <a href="https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ">
     <img alt="Join Slack" src="https://img.shields.io/badge/LMCache-Join%20Slack-blue?logo=slack">
   </a>
-
-
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/w/LMCache/LMCache">
-
-
   <img alt="PyPI - Downloads" src="https://img.shields.io/pypi/dm/LMCache">
-
   <a href="https://www.youtube.com/channel/UC58zMz55n70rtf1Ak2PULJA">
     <img alt="YouTube Channel Views" src="https://img.shields.io/youtube/channel/views/UC58zMz55n70rtf1Ak2PULJA">
   </a>
-
-
 </p>
 
 <h3 align="center">
@@ -36,7 +31,7 @@ LMCache is an **LLM** serving engine extension to **reduce TTFT** and **increase
 
 By combining LMCache with vLLM, LMCache achieves 3-10x delay savings and GPU cycle reduction in many LLM use cases, including multi-round QA and RAG.
 
-Try LMCache with pre-built vllm docker images [here](https://docs.lmcache.ai/getting_started/docker.html).
+Try LMCache with pre-built vllm docker images [here](https://docs.lmcache.ai/developer_guide/docker_file.html).
 
 # 🚀 Performance snapshot
 ![image](https://github.com/user-attachments/assets/7db9510f-0104-4fb3-9976-8ad5d7fafe26)

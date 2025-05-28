@@ -1,11 +1,28 @@
-import os
-import threading
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standard
 from collections import OrderedDict
 from typing import List, Optional
+import os
+import threading
 
+# First Party
 from lmcache.logging import init_logger
-from lmcache.server.server_storage_backend.abstract_backend import \
-    LMSBackendInterface
+from lmcache.server.server_storage_backend.abstract_backend import (
+    LMSBackendInterface,
+)
 from lmcache.storage_backend.evictor import DummyEvictor
 from lmcache.storage_backend.evictor.base_evictor import PutStatus
 from lmcache.utils import DiskCacheMetadata, _lmcache_nvtx_annotate
@@ -15,14 +32,16 @@ logger = init_logger(__name__)
 
 class LMSLocalBackend(LMSBackendInterface):
     """
-    Cache engine for storing the KV cache of the tokens in the local cpu/gpu 
+    Cache engine for storing the KV cache of the tokens in the local cpu/gpu
     memory.
     """
 
-    def __init__(self, ):
+    def __init__(
+        self,
+    ):
         """
         Throws:
-            RuntimeError if the loaded configuration does not match the current 
+            RuntimeError if the loaded configuration does not match the current
             configuration
         """
         super().__init__()
@@ -34,7 +53,6 @@ class LMSLocalBackend(LMSBackendInterface):
         self.evictor = DummyEvictor()
 
     def list_keys(self) -> List[str]:
-
         return list(self.dict.keys())
 
     def contains(
@@ -76,7 +94,7 @@ class LMSLocalBackend(LMSBackendInterface):
 
         Input:
             key: the key of the token chunk, including prefix hash and format
-            kv_chunk_bytes: the kv cache of the token chunk, in the format of 
+            kv_chunk_bytes: the kv cache of the token chunk, in the format of
             bytearray
 
         Returns:
@@ -91,7 +109,8 @@ class LMSLocalBackend(LMSBackendInterface):
         self.update_lock.acquire()
         # Obtain keys to evict
         evict_keys, put_status = self.evictor.update_on_put(
-            self.dict, self.evictor.get_size(kv_chunk_bytes))
+            self.dict, self.evictor.get_size(kv_chunk_bytes)
+        )
 
         # Abort put if cache too big
         if put_status == PutStatus.ILLEGAL:
@@ -164,7 +183,6 @@ class LMSLocalDiskBackend(LMSBackendInterface):
         self.evictor = DummyEvictor()
 
     def list_keys(self) -> List[str]:
-
         return list(self.dict.keys())
 
     def contains(
@@ -226,7 +244,7 @@ class LMSLocalDiskBackend(LMSBackendInterface):
 
         Input:
             key: the key of the token chunk, including prefix hash and format
-            kv_chunk: the kv cache of the token chunk, in the format of nested 
+            kv_chunk: the kv cache of the token chunk, in the format of nested
             tuples
 
         Returns:
@@ -241,7 +259,8 @@ class LMSLocalDiskBackend(LMSBackendInterface):
 
         # Obtain keys to evict
         evict_keys, put_status = self.evictor.update_on_put(
-            self.dict, self.evictor.get_size(kv_chunk_bytes))
+            self.dict, self.evictor.get_size(kv_chunk_bytes)
+        )
 
         # Abort put if cache too big
         if put_status == PutStatus.ILLEGAL:
@@ -257,8 +276,7 @@ class LMSLocalDiskBackend(LMSBackendInterface):
             binary_file.write(kv_chunk_bytes)
 
         self.update_lock.acquire()
-        self.dict[key] = DiskCacheMetadata(
-            path, self.evictor.get_size(kv_chunk_bytes))
+        self.dict[key] = DiskCacheMetadata(path, self.evictor.get_size(kv_chunk_bytes))
         self.update_lock.release()
 
     @_lmcache_nvtx_annotate

@@ -1,15 +1,35 @@
-import re
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standard
 from dataclasses import dataclass
 from typing import List, Optional
+import re
 
+# First Party
 from lmcache.config import GlobalConfig
 from lmcache.logging import init_logger
 from lmcache.storage_backend.connector.base_connector import (
-    RemoteConnector, RemoteConnectorDebugWrapper)
+    RemoteConnector,
+    RemoteConnectorDebugWrapper,
+)
 from lmcache.storage_backend.connector.lm_connector import LMCServerConnector
 from lmcache.storage_backend.connector.membrain_connector import MembrainConnector
 from lmcache.storage_backend.connector.redis_connector import (
-    RedisConnector, RedisSentinelConnector)
+    RedisConnector,
+    RedisSentinelConnector,
+)
 
 logger = init_logger(__name__)
 
@@ -47,8 +67,8 @@ def parse_remote_url(url: str) -> ParsedRemoteURL:
         m = re.match(r"(.+):(\d+)", body)
         if m is None:
             logger.error(
-                f"Cannot parse url body {body} from remote_url {url} in the "
-                f"config")
+                f"Cannot parse url body {body} from remote_url {url} in the config"
+            )
             raise ValueError(f"Invalid remote url {url}")
 
         host, port = m.group(1), int(m.group(2))
@@ -78,12 +98,19 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
                 connector = RedisConnector(host, port)
             else:
                 raise ValueError(
-                    f"Redis connector only supports a single host, but got url:"
-                    f" {url}")
+                    f"Redis connector only supports a single host, but got url: {url}"
+                )
 
         case "redis-sentinel":
             connector = RedisSentinelConnector(
-                list(zip(parsed_url.hosts, map(int, parsed_url.ports))))
+                list(
+                    zip(
+                        parsed_url.hosts,
+                        map(int, parsed_url.ports),
+                        strict=False,
+                    )
+                )
+            )
 
         case "lm":
             if num_hosts == 1:
@@ -91,6 +118,7 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
                 connector = LMCServerConnector(host, port)
             else:
                 raise ValueError(
+<<<<<<< HEAD
                     f"LM connector only supports a single host, but got url:"
                     f" {url}")
                 
@@ -103,11 +131,23 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
                 raise ValueError(
                     f"Membrain connector only supports a single host, but got url:"
                     f" {url}")
+=======
+                    f"LM connector only supports a single host, but got url: {url}"
+                )
+>>>>>>> upstream/dev
 
         case _:
             raise ValueError(
-                f"Unknown connector type {parsed_url.connector_type} "
-                f"(url is: {url})")
+                f"Unknown connector type {parsed_url.connector_type} (url is: {url})"
+            )
 
+<<<<<<< HEAD
     return (connector if not GlobalConfig.is_debug() else
             RemoteConnectorDebugWrapper(connector))
+=======
+    return (
+        connector
+        if not GlobalConfig.is_debug()
+        else RemoteConnectorDebugWrapper(connector)
+    )
+>>>>>>> upstream/dev

@@ -1,10 +1,27 @@
-import abc
-import time
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standard
 from enum import Enum
 from typing import List, Optional
+import abc
+import time
 
+# Third Party
 import torch
 
+# First Party
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 
@@ -88,7 +105,6 @@ class RemoteTensorConnector(RemoteConnector):
 
 
 class RemoteConnectorDebugWrapper(RemoteConnector):
-
     def __init__(self, connector: RemoteConnector):
         self.connector = connector
 
@@ -102,8 +118,7 @@ class RemoteConnectorDebugWrapper(RemoteConnector):
         end = time.perf_counter()
 
         if ret is None or len(ret) == 0:
-            logger.debug(
-                "Didn't get any data from the remote backend, key is {key}")
+            logger.debug("Didn't get any data from the remote backend, key is {key}")
             return None
 
         if check_connector_type(self.connector) == ConnectorType.BYTES:
@@ -160,4 +175,4 @@ def check_connector_type(connector: RemoteConnector) -> ConnectorType:
         # TODO: avoid possible recursive deadlock
         return check_connector_type(connector.connector)
 
-    raise ValueError('Unsupported connector type')
+    raise ValueError("Unsupported connector type")
