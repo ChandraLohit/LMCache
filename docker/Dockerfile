@@ -73,6 +73,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ARG LMCACHE_COMMIT_ID=1
 
 RUN git clone https://github.com/prashant182/LMCache.git
+RUN git clone https://github.com/prashant182/LMCache.git
 
 WORKDIR /workspace/LMCache
 RUN git checkout memb
@@ -96,11 +97,19 @@ pip install dist_lmcache/*.whl --verbose
 #     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
 # COPY patch/lmcache_connector.py \
 #     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
+# COPY patch/factory.py \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
+# COPY patch/lmcache_connector.py \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/
 
 # Use diff if file is too large
 # COPY patch/parallel_state.patch \
 #     /usr/local/lib/python3.12/dist-packages/vllm/distributed/
+# COPY patch/parallel_state.patch \
+#     /usr/local/lib/python3.12/dist-packages/vllm/distributed/
 
+#RUN patch /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py \
+#    /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.patch
 #RUN patch /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py \
 #    /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.patch
 
