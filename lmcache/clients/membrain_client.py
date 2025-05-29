@@ -82,7 +82,7 @@ class MembrainClient:
             raise MembrainError("Client is closed")
 
         timeout = timeout or self._config.timeout
-        url = urljoin(self._config.endpoint, f"/memory/{self._config.namespace}/{key}")
+        url = urljoin(self._config.endpoint, f"/v1/kv/{self._config.namespace}/{key}")
 
         for attempt in range(self._config.max_retries):
             try:
