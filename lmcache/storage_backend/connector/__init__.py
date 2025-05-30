@@ -118,7 +118,6 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
                 connector = LMCServerConnector(host, port)
             else:
                 raise ValueError(
-<<<<<<< HEAD
                     f"LM connector only supports a single host, but got url:"
                     f" {url}")
                 
@@ -131,23 +130,11 @@ def CreateConnector(url: str, device=None) -> RemoteConnector:
                 raise ValueError(
                     f"Membrain connector only supports a single host, but got url:"
                     f" {url}")
-=======
-                    f"LM connector only supports a single host, but got url: {url}"
-                )
->>>>>>> upstream/dev
 
         case _:
             raise ValueError(
                 f"Unknown connector type {parsed_url.connector_type} (url is: {url})"
             )
 
-<<<<<<< HEAD
     return (connector if not GlobalConfig.is_debug() else
             RemoteConnectorDebugWrapper(connector))
-=======
-    return (
-        connector
-        if not GlobalConfig.is_debug()
-        else RemoteConnectorDebugWrapper(connector)
-    )
->>>>>>> upstream/dev
