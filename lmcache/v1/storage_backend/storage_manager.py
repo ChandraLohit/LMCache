@@ -218,7 +218,24 @@ class StorageManager:
             # Tune the timeout for better performance
             prefetch_task.result(timeout=1)
 
-        # Search all backends for blocking get
+        # DEBUG: Force remote backends first to test zero-copy Membrain GET
+        import os
+        force_remote_first = os.environ.get("LMCACHE_DEBUG_FORCE_REMOTE_FIRST", "false").lower() == "true"
+        
+        if force_remote_first:
+            # Try remote backends first (for testing zero-copy)
+            for backend_name, backend in self.storage_backends.items():
+                if backend_name != "LocalCPUBackend":
+                    memory_obj = backend.get_blocking(key)
+                    if memory_obj is not None:
+                        logger.info(f" DEBUG: Got data from remote backend {backend_name}")
+                        # Still write back to local CPU for consistency
+                        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+                        assert isinstance(local_cpu_backend, LocalCPUBackend)
+                        local_cpu_backend.write_back(key, memory_obj)
+                        return memory_obj
+        
+        # Search all backends for blocking get (normal flow)
         for backend_name, backend in self.storage_backends.items():
             # NOTE(Jiayi): bypass the allocator for now
             memory_obj = backend.get_blocking(key)
@@ -236,8 +253,22 @@ class StorageManager:
         Non-blocking function to get the memory object from the storages.
         """
         # TODO (Jiayi): incorporate prefetching here
+        
+        # DEBUG: Force remote backends first to test zero-copy Membrain GET
+        import os
+        force_remote_first = os.environ.get("LMCACHE_DEBUG_FORCE_REMOTE_FIRST", "false").lower() == "true"
+        
+        if force_remote_first:
+            # Try remote backends first (for testing zero-copy)
+            for backend_name, backend in self.storage_backends.items():
+                if backend_name != "LocalCPUBackend":
+                    task = backend.get_non_blocking(key)
+                    if task is not None:
+                        logger.info(f" DEBUG: Got non-blocking task from remote backend {backend_name}")
+                        # TODO (Jiayi): add write-back logic here
+                        return task
 
-        # Search all backends for non-blocking get
+        # Search all backends for non-blocking get (normal flow)
         for backend_name, backend in self.storage_backends.items():
             # NOTE(Jiayi): bypass the allocator for now
             task = backend.get_non_blocking(key)

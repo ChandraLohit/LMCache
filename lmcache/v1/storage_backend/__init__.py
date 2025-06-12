@@ -58,12 +58,47 @@ def CreateStorageBackends(
     # TODO(Jiayi): The hierarchy is fixed for now
     # NOTE(Jiayi): The local_cpu backend is always created because
     # other backends might need it as a buffer.
-    local_cpu_backend = LocalCPUBackend(
-        config,
-        memory_allocator,
-        lookup_server,
-        lmcache_worker,
+    # ZERO-COPY FIX: Create minimal LocalCPU backend if max_local_cpu_size is 0
+    logger.info(f"LocalCPU Backend Creation: max_local_cpu_size={config.max_local_cpu_size} (type: {type(config.max_local_cpu_size)}), remote_url={config.remote_url}")
+    
+    # Handle various representations of zero: 0, 0.0, or very small values
+    is_zero_cpu = (
+        config.max_local_cpu_size == 0 or 
+        config.max_local_cpu_size == 0.0 or 
+        (isinstance(config.max_local_cpu_size, (int, float)) and abs(config.max_local_cpu_size) < 0.001)
     )
+    has_remote = config.remote_url is not None and config.remote_url.strip() != ""
+    
+    if is_zero_cpu and has_remote:
+        # For zero-copy remote backends, we need minimal LocalCPU buffer for temporary storage
+        # during PUT operations before transfer to remote
+        try:
+            from dataclasses import replace
+            minimal_config = replace(config, max_local_cpu_size=0.1)  # 100MB minimal buffer
+            logger.info(" ZERO-COPY MODE: Creating minimal LocalCPU buffer (100MB) for remote backend operations")
+            local_cpu_backend = LocalCPUBackend(
+                minimal_config,
+                memory_allocator,
+                lookup_server,
+                lmcache_worker,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create minimal LocalCPU backend: {e}")
+            # Fallback to original config
+            local_cpu_backend = LocalCPUBackend(
+                config,
+                memory_allocator,
+                lookup_server,
+                lmcache_worker,
+            )
+    else:
+        logger.info(f"Standard LocalCPU backend: is_zero_cpu={is_zero_cpu}, has_remote={has_remote}")
+        local_cpu_backend = LocalCPUBackend(
+            config,
+            memory_allocator,
+            lookup_server,
+            lmcache_worker,
+        )
     backend_name = str(local_cpu_backend)
     storage_backends[backend_name] = local_cpu_backend
 

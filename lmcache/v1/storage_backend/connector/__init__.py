@@ -255,6 +255,19 @@ def CreateConnector(
                 raise AttributeError(
                     f"Module '{module_path}' has no class '{connector_name}'"
                 ) from e
+        case "membrain":
+            if num_hosts != 1:
+                raise ValueError(
+                    f"Membrain connector only supports a single host, but got url: {url}"
+                )
+            host, port = parsed_url.hosts[0], parsed_url.ports[0]
+            namespace = parsed_url.query_params[0].get("namespace", "default")
+            endpoint = f"http://{host}:{port}"
+            
+            # Import here to avoid circular imports
+            from lmcache.v1.membrain_connector import MembrainConnector
+            connector = MembrainConnector(endpoint, namespace, loop, local_cpu_backend)
+            
         case _:
             raise ValueError(f"Unknown connector type {connector_type} (url is: {url})")
 

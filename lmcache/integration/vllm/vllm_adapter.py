@@ -64,6 +64,7 @@ from lmcache.v1.gpu_connector import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
+from lmcache.v1.membrain_gpu_connector import BedrockMembrainGPUConnector
 
 # FIXME(Jiayi): temporarily comment this out
 # from lmcache_vllm.blend_adapter import remove_request_id_indices
@@ -185,11 +186,19 @@ def init_lmcache_engine(
     )
 
     use_gpu = need_gpu_interm_buffer(config)
+    
+    # Check if Membrain is configured for zero-copy operations
+    is_membrain_configured = (
+        config.remote_url is not None and 
+        "membrain" in config.remote_url.lower()
+    )
+    
     vllm_gpu_connector: Union[
         VLLMBufferLayerwiseGPUConnector,
         VLLMPagedMemGPUConnectorV2,
         VLLMPagedMemLayerwiseGPUConnector,
         VLLMPagedMemGPUConnectorMLA,
+        BedrockMembrainGPUConnector,
     ]
 
     if use_mla:
@@ -218,7 +227,8 @@ def init_lmcache_engine(
                     device=device,
                 )
             else:
-                vllm_gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
+                # Create base layerwise connector
+                base_connector = VLLMPagedMemLayerwiseGPUConnector(
                     hidden_dim_size,
                     num_layer,
                     use_gpu=use_gpu,
@@ -226,7 +236,16 @@ def init_lmcache_engine(
                     dtype=kv_dtype,
                     device=device,
                 )
+                
+                # Use Membrain GPU connector for zero-copy if configured
+                if is_membrain_configured:
+                    logger.info(" Using BedrockMembrainGPUConnector for zero-copy Membrain operations")
+                    vllm_gpu_connector = BedrockMembrainGPUConnector.from_base(base_connector)
+                else:
+                    vllm_gpu_connector = base_connector
         else:
+            # For non-layerwise mode, use regular GPU connector
+            # BedrockMembrainGPUConnector is only designed for layerwise operations
             vllm_gpu_connector = VLLMPagedMemGPUConnectorV2(
                 hidden_dim_size,
                 num_layer,

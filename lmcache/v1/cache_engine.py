@@ -277,7 +277,6 @@ class LMCacheEngine:
                     "The KV cache will not be stored."
                 )
                 break
-
             self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)
             self.storage_manager.put(key, memory_obj)
 
@@ -780,7 +779,24 @@ class LMCacheEngineBuilder:
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
         max_local_cpu_size = config.max_local_cpu_size
-        return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
+        
+        # ZERO-COPY FIX: Ensure minimal memory allocation for remote backends
+        # Handle various representations of zero: 0, 0.0, or very small values  
+        is_zero_cpu = (
+            max_local_cpu_size == 0 or 
+            max_local_cpu_size == 0.0 or 
+            (isinstance(max_local_cpu_size, (int, float)) and abs(max_local_cpu_size) < 0.001)
+        )
+        has_remote = config.remote_url is not None and config.remote_url.strip() != ""
+        
+        if is_zero_cpu and has_remote:
+            # For zero-copy remote backends, allocate minimal buffer (100MB) for temporary storage
+            logger.info(" ZERO-COPY MEMORY ALLOCATOR: Creating 100MB buffer for remote backend operations")
+            effective_size = 0.1  # 100MB
+        else:
+            effective_size = max_local_cpu_size
+            
+        return MixedMemoryAllocator(int(effective_size * 1024**3))
 
     @staticmethod
     def _Create_token_database(

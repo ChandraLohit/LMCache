@@ -326,6 +326,12 @@ class LocalCPUBackend(StorageBackendInterface):
         if memory_obj is None or not self.use_hot:
             return
 
+        # Skip write-back for lease-based objects (e.g., from Membrain)
+        # These don't contain actual tensor data, just references/leases
+        if memory_obj.tensor is None:
+            logger.debug(f"Skipping write_back for lease-based memory object: {key}")
+            return
+
         if memory_obj.tensor is not None and memory_obj.tensor.is_cuda:
             self.cpu_lock.acquire()
             if key in self.hot_cache:
