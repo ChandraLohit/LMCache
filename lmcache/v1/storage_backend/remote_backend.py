@@ -226,7 +226,57 @@ class RemoteBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[Future]:
-        raise NotImplementedError
+        """
+        Non-blocking get function for layerwise operations.
+        Returns a Future that will be resolved with the deserialized memory object.
+        """
+        logger.info(f"RemoteBackend.get_non_blocking called for key: {key}")
+        
+        if self.connection is None:
+            logger.warning("Connection is None in get_non_blocking, returning None")
+            return None
+        
+        # Create async future for the remote get operation
+        try:
+            async_future = asyncio.run_coroutine_threadsafe(self.connection.get(key), self.loop)
+            logger.info(f"Created async future for key: {key}")
+            
+            # Create wrapper future to handle deserialization
+            wrapper_future: Future = Future()
+            
+            def handle_async_result(fut):
+                try:
+                    t1 = time.perf_counter()
+                    memory_obj = fut.result()
+                    t2 = time.perf_counter()
+                    self.stats_monitor.update_interval_remote_time_to_get_sync((t2 - t1) * 1000)
+                    
+                    if memory_obj is None:
+                        logger.debug(f"🔍 Key not found in remote backend: {key}")
+                        wrapper_future.set_result(None)
+                        return
+                    
+                    # Deserialize the result
+                    decompressed_memory_obj = self.deserializer.deserialize(memory_obj)
+                    t3 = time.perf_counter()
+                    logger.debug(f"Deserialized remote object for key: {key} (deserialize time: {(t3-t2)*1000:.3f}ms)")
+                    wrapper_future.set_result(decompressed_memory_obj)
+                    
+                except Exception as e:
+                    with self.lock:
+                        self.connection = None
+                        self.failure_time = time.time()
+                    logger.warning(f"Error in get_non_blocking for key {key}: {e}")
+                    wrapper_future.set_result(None)
+            
+            # Set up callback to handle the async result
+            async_future.add_done_callback(handle_async_result)
+            
+            return wrapper_future
+            
+        except Exception as e:
+            logger.error(f"Failed to create async future for key {key}: {e}")
+            return None
 
     def pin(self, key: CacheEngineKey) -> bool:
         logger.warning(

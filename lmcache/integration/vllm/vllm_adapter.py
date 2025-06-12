@@ -193,6 +193,10 @@ def init_lmcache_engine(
         "membrain" in config.remote_url.lower()
     )
     
+    logger.info(f"GPU CONNECTOR SELECTION: use_layerwise={config.use_layerwise}, remote_url={config.remote_url}")
+    logger.info(f"MEMBRAIN DETECTION: is_membrain_configured={is_membrain_configured}")
+    logger.info(f"OTHER CONFIG: enable_blending={config.enable_blending}, use_mla={use_mla}")
+    
     vllm_gpu_connector: Union[
         VLLMBufferLayerwiseGPUConnector,
         VLLMPagedMemGPUConnectorV2,
@@ -239,13 +243,23 @@ def init_lmcache_engine(
                 
                 # Use Membrain GPU connector for zero-copy if configured
                 if is_membrain_configured:
-                    logger.info(" Using BedrockMembrainGPUConnector for zero-copy Membrain operations")
+                    logger.info("USING BEDROCK MEMBRAIN GPU CONNECTOR for zero-copy Membrain operations")
                     vllm_gpu_connector = BedrockMembrainGPUConnector.from_base(base_connector)
+                    logger.info(f"CREATED: {type(vllm_gpu_connector).__name__}")
                 else:
+                    logger.info("📋 USING REGULAR LAYERWISE GPU CONNECTOR (no Membrain)")
                     vllm_gpu_connector = base_connector
         else:
             # For non-layerwise mode, use regular GPU connector
             # BedrockMembrainGPUConnector is only designed for layerwise operations
+            if is_membrain_configured:
+                logger.warning("⚠️  MEMBRAIN + NON-LAYERWISE: Membrain detected but use_layerwise=False!")
+                logger.warning("⚠️  BedrockMembrainGPUConnector requires use_layerwise=True")
+                logger.warning("⚠️  Using regular GPU connector - zero-copy will NOT work")
+                logger.warning("⚠️  To fix: Set use_layerwise=True in your LMCache config")
+            else:
+                logger.info("📋 USING NON-LAYERWISE GPU CONNECTOR (standard)")
+            
             vllm_gpu_connector = VLLMPagedMemGPUConnectorV2(
                 hidden_dim_size,
                 num_layer,
@@ -254,6 +268,8 @@ def init_lmcache_engine(
                 dtype=kv_dtype,
                 device=device,
             )
+    logger.info(f"CREATING ENGINE with GPU connector: {type(vllm_gpu_connector).__name__}")
+    
     engine = LMCacheEngineBuilder.get_or_create(
         ENGINE_NAME, config, metadata, vllm_gpu_connector
     )

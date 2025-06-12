@@ -296,11 +296,11 @@ if __name__ == "__main__":
                         retrieved_cache, slot_mapping, pattern_value
                     ):
                         logger.info(
-                            "✅ Data verification successful - pattern matches!"
+                            "Data verification successful - pattern matches!"
                         )
                     else:
                         logger.error(
-                            "❌ Data verification failed - pattern doesn't match!"
+                            "Data verification failed - pattern doesn't match!"
                         )
                 else:
                     logger.error(

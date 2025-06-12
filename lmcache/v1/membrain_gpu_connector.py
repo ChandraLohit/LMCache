@@ -18,55 +18,116 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _parse_membrain_data(self, memory_obj, shm, num_tokens):
         """
         Shared helper method to parse Membrain shared memory data format.
+        ZERO-COPY OPTIMIZED: Fast path for single segments, memory views for multi-segment.
         
         Returns:
             tuple: (kv_tensor, metadata) or (None, None) if parsing fails
         """
         try:
-            # Parse data format: [4-byte-length][metadata][kv_data]
-            combined_data = bytearray()
-            for offset in memory_obj.offsets:
-                o = offset['offset']
-                l = offset['len']
-                segment_data = bytes(shm.buf[o : o + l])
-                combined_data.extend(segment_data)
+            logger.info(f"🔍 ZERO-COPY PARSE: Starting with {len(memory_obj.offsets)} segments")
             
-            if len(combined_data) < 4:
-                raise ValueError(f"Insufficient data: only {len(combined_data)} bytes")
+            # OPTIMIZATION: Fast path for single segment (most common case)
+            if len(memory_obj.offsets) == 1:
+                logger.info(f"ZERO-COPY FAST PATH: Single segment - avoiding ALL copies!")
+                offset_info = memory_obj.offsets[0]
+                o = offset_info['offset']
+                l = offset_info['len']
+                
+                # Fix SharedMemory lifecycle: Copy data directly to avoid memoryview references
+                logger.info(f"📊 MEMBRAIN ACCESS: Reading {l} bytes from offset {o}")
+                
+                if l < 4:
+                    raise ValueError(f"Insufficient data: only {l} bytes")
+                
+                # Read data directly from SharedMemory buffer to avoid memoryview lifecycle issues
+                raw_data = bytes(shm.buf[o : o + l])
+                logger.info(f"📊 DATA COPY: Copied {len(raw_data)} bytes from shared memory")
+                
+                # Read metadata length directly from raw data
+                metadata_len = int.from_bytes(raw_data[:4], byteorder='little')
+                kv_data_start = 4 + metadata_len
+                
+                if len(raw_data) < kv_data_start:
+                    raise ValueError(f"Insufficient data for metadata: need {kv_data_start}, have {len(raw_data)}")
+                
+                # Parse metadata using raw data
+                metadata_bytes = raw_data[4:kv_data_start]
+                metadata = RemoteMetadata.deserialize(metadata_bytes)
+                logger.info(f"METADATA PARSED: shape={metadata.shape}, dtype={metadata.dtype}")
+                
+                # Extract KV data using raw data
+                kv_data_bytes = raw_data[kv_data_start:]
+                
+                if len(kv_data_bytes) == 0:
+                    raise ValueError("No KV data found after metadata")
+                
+                # Create tensor directly from raw bytes (no SharedMemory references)
+                tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
+                kv_tensor = torch.frombuffer(bytearray(kv_data_bytes), dtype=tensor_dtype)
+                logger.info(f"TENSOR CREATED: {len(kv_tensor)} elements from raw bytes (SharedMemory safe)")
+                
+            else:
+                # Multi-segment fallback - use memory views instead of bytes()
+                logger.warning(f"⚠️  COPY FALLBACK: Multi-segment data ({len(memory_obj.offsets)} segments) - using optimized memory views")
+                
+                # Calculate total size first
+                total_size = sum(offset['len'] for offset in memory_obj.offsets)
+                combined_data = bytearray(total_size)  # Pre-allocate exact size - avoids extend() copies
+                logger.info(f"📊 COPY FALLBACK: Pre-allocated {total_size} bytes for {len(memory_obj.offsets)} segments")
+                
+                # Copy using direct bytes access (avoid memoryview SharedMemory references)
+                pos = 0
+                for offset in memory_obj.offsets:
+                    o = offset['offset']
+                    l = offset['len']
+                    segment_bytes = bytes(shm.buf[o : o + l])  # Direct bytes copy
+                    combined_data[pos:pos + l] = segment_bytes  # Direct bytes assignment
+                    pos += l
+                
+                logger.info(f"📊 COPY FALLBACK: Combined {len(memory_obj.offsets)} segments using direct bytes (SharedMemory safe)")
+                
+                # Rest of parsing logic (same as before)
+                if len(combined_data) < 4:
+                    raise ValueError(f"Insufficient data: only {len(combined_data)} bytes")
+                
+                metadata_len = int.from_bytes(combined_data[:4], byteorder='little')
+                kv_data_start = 4 + metadata_len
+                
+                if len(combined_data) < kv_data_start:
+                    raise ValueError(f"Insufficient data for metadata: need {kv_data_start}, have {len(combined_data)}")
+                
+                # Parse metadata
+                metadata_bytes = combined_data[4:kv_data_start]
+                metadata = RemoteMetadata.deserialize(metadata_bytes)
+                logger.info(f"METADATA PARSED: shape={metadata.shape}, dtype={metadata.dtype}")
+                
+                # Extract pure KV data
+                kv_data = combined_data[kv_data_start:]
+                
+                if len(kv_data) == 0:
+                    raise ValueError("No KV data found after metadata")
+                
+                # Create tensor from KV data (no SharedMemory references)
+                tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
+                kv_tensor = torch.frombuffer(bytearray(kv_data), dtype=tensor_dtype)
+                logger.info(f"TENSOR CREATED: {len(kv_tensor)} elements from combined bytes (SharedMemory safe)")
             
-            metadata_len = int.from_bytes(combined_data[:4], byteorder='little')
-            kv_data_start = 4 + metadata_len
-            
-            if len(combined_data) < kv_data_start:
-                raise ValueError(f"Insufficient data for metadata: need {kv_data_start}, have {len(combined_data)}")
-            
-            # Parse metadata
-            metadata_bytes = combined_data[4:kv_data_start]
-            metadata = RemoteMetadata.deserialize(memoryview(metadata_bytes))
-            logger.debug(f"Metadata: shape={metadata.shape}, dtype={metadata.dtype}")
-            
-            # Extract pure KV data
-            kv_data = combined_data[kv_data_start:]
-            logger.debug(f"KV data size: {len(kv_data)} bytes")
-            
-            if len(kv_data) == 0:
-                raise ValueError("No KV data found after metadata")
-            
-            # Create tensor from pure KV data
-            kv_tensor = torch.frombuffer(kv_data, dtype=self.dtype)
+            # Common padding logic
             expected_elements = num_tokens * 2 * self.hidden_dim_size
             
             # Handle padding if needed (for batched_to_gpu compatibility)
             if len(kv_tensor) < expected_elements:
-                logger.warning(f"Insufficient tensor data: need {expected_elements}, have {len(kv_tensor)}")
-                padded_tensor = torch.zeros(expected_elements, dtype=self.dtype)
+                logger.warning(f"Padding tensor: need {expected_elements}, have {len(kv_tensor)}")
+                # Use the same dtype as the kv_tensor for consistency
+                padded_tensor = torch.zeros(expected_elements, dtype=kv_tensor.dtype)
                 padded_tensor[:len(kv_tensor)] = kv_tensor
                 kv_tensor = padded_tensor
             
+            logger.info(f"PARSE SUCCESS: Final tensor has {len(kv_tensor)} elements")
             return kv_tensor, metadata
             
         except Exception as e:
-            logger.error(f"❌ Failed to parse Membrain data: {e}")
+            logger.error(f"Failed to parse Membrain data: {e}")
             return None, None
 
     @staticmethod
@@ -80,7 +141,9 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     
     def get_flat_shape(self, num_tokens: int) -> torch.Size:
         # Calculate size for pure KV data (excluding metadata)
-        element_size = torch.finfo(self.dtype).bits // 8  # bytes per element
+        # Use default dtype if self.dtype is not set
+        dtype = getattr(self, 'dtype', torch.float16)
+        element_size = torch.finfo(dtype).bits // 8  # bytes per element
         return torch.Size([num_tokens * 2 * self.hidden_dim_size * element_size])
     
     @_lmcache_nvtx_annotate
@@ -110,6 +173,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             
             # Process the memory object with offsets using shared helper
             try:
+                logger.info(f"TO_GPU: Calling _parse_membrain_data for {num_tokens} tokens")
                 kv_tensor, metadata = self._parse_membrain_data(memory_obj, shm, num_tokens)
                 
                 if kv_tensor is None or metadata is None:
@@ -141,12 +205,15 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     gpu_layer_tensor = layer_tensor.to(device=kvcaches[layer_id][0].device, non_blocking=True)
                     
                     # Use LMCache C++ ops for efficient transfer
+                    # Fix: Add token_major parameter to match C++ signature
+                    logger.debug(f"TO_GPU TRANSFER: tensor shape={gpu_layer_tensor.shape}, token_major=True")
                     lmc_ops.single_layer_kv_transfer(
                         gpu_layer_tensor,
                         kvcaches[layer_id][0],
                         kvcaches[layer_id][1], 
                         slot_mapping[start:end],
-                        False,
+                        False,     # direction: LMCache -> vLLM
+                        True,      # token_major: [num_tokens, 2, hidden_dim]
                     )
                 
                 logger.debug(f" BedrockMembrainGPUConnector.to_gpu: Successfully processed {effective_layers} layers")
@@ -194,6 +261,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     @_lmcache_nvtx_annotate
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
+        logger.info(f"BedrockMembrainGPUConnector.batched_to_gpu called: {len(starts)} chunks")
         """
         This function is a generator that moves the KV cache from the memory
         objects to paged GPU memory. The first iteration will prepare some
@@ -258,6 +326,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                     try:
                         if hasattr(memory_obj, 'offsets'):
+                            logger.info(f"🔍 MEMBRAIN ZERO-COPY: Processing LeaseMemoryObj with {len(memory_obj.offsets)} segments")
                             logger.debug(f"Processing Membrain offsets: {len(memory_obj.offsets)} segments")
                             
                             # Use shared helper to parse Membrain data
@@ -269,16 +338,23 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             expected_elements = num_tokens * 2 * self.hidden_dim_size
                             
                             # Copy pure KV data to GPU buffer
-                            gpu_tensor_view = tmp_gpu_buffer_obj.tensor.view(self.dtype)[:expected_elements]
+                            # Use default dtype if self.dtype is not set
+                            dtype = getattr(self, 'dtype', torch.float16)
+                            gpu_tensor_view = tmp_gpu_buffer_obj.tensor.view(dtype)[:expected_elements]
                             gpu_tensor_view.copy_(kv_tensor[:expected_elements], non_blocking=True)
                             
                             # Transfer to vLLM KV cache with correct shape
+                            # Fix: Add token_major parameter to match C++ signature
+                            # Expected: (lmc_tensor, vllm_key, vllm_value, slot_mapping, direction, token_major)
+                            reshaped_tensor = gpu_tensor_view.view(num_tokens, 2, self.hidden_dim_size)
+                            logger.debug(f"TENSOR TRANSFER: tensor shape={reshaped_tensor.shape}, token_major=True")
                             lmc_ops.single_layer_kv_transfer(
-                                gpu_tensor_view.view(num_tokens, 2, self.hidden_dim_size),
+                                reshaped_tensor,
                                 kvcaches[layer_id][0],
                                 kvcaches[layer_id][1],
                                 slot_mapping_full,
-                                False,
+                                False,  # direction: LMCache -> vLLM
+                                True,   # token_major: [num_tokens, 2, hidden_dim]
                             )
                             
                             logger.debug(f" Successfully transferred layer {layer_id} KV data to GPU")

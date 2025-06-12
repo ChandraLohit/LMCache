@@ -325,6 +325,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        logger.info(f"VLLMPagedMemGPUConnectorV2.to_gpu: memory_obj type={type(memory_obj).__name__}, has_tensor={memory_obj.tensor is not None}, has_offsets={hasattr(memory_obj, 'offsets')}")
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
 
@@ -449,11 +450,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             )
             memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            torch.cuda.synchronize()
+        # if not memory_obj.tensor.is_cuda:
+        #     # Force a synchronize if the target buffer is NOT CUDA device
+        #     # NOTE: for better performance, we may not want to sync for every
+        #     # memory object
+        #     torch.cuda.synchronize()
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
