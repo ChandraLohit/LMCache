@@ -14,7 +14,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 import threading
 
 # Third Party
@@ -32,6 +32,7 @@ import vllm.envs as envs
 import zmq
 
 # First Party
+from lmcache.config import LMCacheEngineConfig as Config  # type: ignore[assignment]
 from lmcache.integration.vllm.lmcache_direct_lookup_client import LMCacheDirectLookupClient
 from lmcache.integration.vllm.utils import ENGINE_NAME, lmcache_get_config
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
@@ -39,6 +40,9 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LayerwiseLMCacheEngine, LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
+from lmcache.v1.config import (
+    LMCacheEngineConfig as V1Config,  # type: ignore[assignment]
+)
 
 if TYPE_CHECKING:
     # Third Party
