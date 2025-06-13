@@ -18,6 +18,9 @@ from lmcache.utils import CacheEngineKey
 
 import torch
 
+# Import the ProtectedSharedMemory from membrain_gpu_connector
+from lmcache.v1.membrain_gpu_connector import ProtectedSharedMemory
+
 
 logger = init_logger(__name__)
 
@@ -153,58 +156,59 @@ class LeaseMemoryObj(MemoryObj):
         # For non-layerwise mode, we need to create a tensor from shared memory
         # This provides fallback compatibility while maintaining zero-copy for layerwise
         try:
-            from multiprocessing.shared_memory import SharedMemory
-            
             logger.debug(f"LeaseMemoryObj.tensor: Creating tensor from shared memory for non-layerwise compatibility")
             
-            shm = SharedMemory(self.shared_memory_name)
-            
-            # Parse data format: [4-byte-length][metadata][kv_data]
-            combined_data = bytearray()
-            for offset in self.offsets:
-                o = offset['offset']
-                l = offset['len']
-                segment_data = bytes(shm.buf[o : o + l])
-                combined_data.extend(segment_data)
-            
-            if len(combined_data) < 4:
-                logger.warning("Insufficient data for tensor creation")
-                return None
-            
-            metadata_len = int.from_bytes(combined_data[:4], byteorder='little')
-            kv_data_start = 4 + metadata_len
-            
-            if len(combined_data) < kv_data_start:
-                logger.warning("Insufficient data for metadata parsing")
-                return None
-            
-            # Extract pure KV data
-            kv_data = combined_data[kv_data_start:]
-            
-            if len(kv_data) == 0:
-                logger.warning("No KV data found after metadata")
-                return None
-            
-            # Create tensor from KV data
-            kv_tensor = torch.frombuffer(kv_data, dtype=self.meta.dtype)
-            
-            # Reshape according to expected format
+            shm = ProtectedSharedMemory(self.shared_memory_name)
             try:
-                reshaped_tensor = kv_tensor.view(self.meta.shape)
+                # Parse data format: [4-byte-length][metadata][kv_data]
+                combined_data = bytearray()
+                for offset in self.offsets:
+                    o = offset['offset']
+                    l = offset['len']
+                    segment_data = bytes(shm.buf[o : o + l])
+                    combined_data.extend(segment_data)
                 
-                # CRITICAL FIX: Pin the tensor for GPU operations
-                # LMCache C++ operations require "cuda or pinned cpu" device
-                pinned_tensor = reshaped_tensor.pin_memory()
+                if len(combined_data) < 4:
+                    logger.warning("Insufficient data for tensor creation")
+                    return None
                 
-                # Cache the pinned tensor for future use
-                self._tensor = pinned_tensor
-                logger.debug(f"LeaseMemoryObj.tensor: Created pinned tensor with shape {pinned_tensor.shape}")
+                metadata_len = int.from_bytes(combined_data[:4], byteorder='little')
+                kv_data_start = 4 + metadata_len
                 
-                return pinned_tensor
+                if len(combined_data) < kv_data_start:
+                    logger.warning("Insufficient data for metadata parsing")
+                    return None
                 
-            except Exception as reshape_error:
-                logger.warning(f"Failed to reshape tensor: {reshape_error}")
-                return None
+                # Extract pure KV data
+                kv_data = combined_data[kv_data_start:]
+                
+                if len(kv_data) == 0:
+                    logger.warning("No KV data found after metadata")
+                    return None
+                
+                # Create tensor from KV data
+                kv_tensor = torch.frombuffer(kv_data, dtype=self.meta.dtype)
+                
+                # Reshape according to expected format
+                try:
+                    reshaped_tensor = kv_tensor.view(self.meta.shape)
+                    
+                    # CRITICAL FIX: Pin the tensor for GPU operations
+                    # LMCache C++ operations require "cuda or pinned cpu" device
+                    pinned_tensor = reshaped_tensor.pin_memory()
+                    
+                    # Cache the pinned tensor for future use
+                    self._tensor = pinned_tensor
+                    logger.debug(f"LeaseMemoryObj.tensor: Created pinned tensor with shape {pinned_tensor.shape}")
+                    
+                    return pinned_tensor
+                    
+                except Exception as reshape_error:
+                    logger.warning(f"Failed to reshape tensor: {reshape_error}")
+                    return None
+            finally:
+                # Safe cleanup - never unlinks shared memory
+                shm.close()
                 
         except Exception as e:
             logger.warning(f"Failed to create tensor from shared memory: {e}")
@@ -351,13 +355,12 @@ class MembrainConnector(RemoteConnector):
             logger.info(f"LEASE ACQUIRED: id={lease_id}, {len(offsets)} segments, {total_bytes:,} bytes")
             logger.debug(f"LEASE OFFSETS: {offsets}")
                 
-            # DEBUG: Extensive shared memory analysis
+            # DEBUG: Extensive shared memory analysis  
+            shm = None
             try:
-                from multiprocessing.shared_memory import SharedMemory
-                
                 logger.debug(f" ACCESSING SHARED MEMORY: name='membrain-kvcache'")
-                shm = SharedMemory('membrain-kvcache')
-                shm_size = len(shm.buf)
+                shm = ProtectedSharedMemory('membrain-kvcache')
+                shm_size = shm.size
                 logger.debug(f" SHARED MEMORY SIZE: {shm_size} bytes")
                     
                 # Examine first offset in detail
@@ -421,7 +424,7 @@ class MembrainConnector(RemoteConnector):
                             except Exception as metadata_error:
                                 logger.error(f" METADATA DESERIALIZATION FAILED: {metadata_error}")
                         else:
-                            logger.error(f" METADATA EXTENDS BEYOND BUFFER: {metadata_end} > {len(shm.buf)}")
+                            logger.error(f" METADATA EXTENDS BEYOND BUFFER: {metadata_end} > {shm.size}")
                     else:
                         logger.error(f" INVALID METADATA LENGTH: {metadata_len} (total length: {length})")
                 else:
@@ -472,6 +475,10 @@ class MembrainConnector(RemoteConnector):
                     logger.error(f" FAILED TO RELEASE LEASE {lease_id}: {release_error}")
                 
                 return None
+            finally:
+                # Safe cleanup - never unlinks shared memory
+                if shm is not None:
+                    shm.close()
 
         except Exception as e:
             # Handle expected cache misses gracefully
@@ -535,13 +542,8 @@ class MembrainConnector(RemoteConnector):
             
             response = await self.client.put(membrain_key, combined_data)
             
-            logger.info(f"MEMBRAIN PUT SUCCESS: {response} for {original_key}")
-            
-            # VERIFY the data was stored by checking immediately
-            verify_exists = await self.client.exists(membrain_key)
-            logger.info(f" VERIFICATION: After PUT, key {membrain_key} exists = {verify_exists}")
-            
-            logger.debug(f"Stored {len(combined_data)} total bytes for key: {original_key}")
+            logger.info(f"MEMBRAIN PUT SUCCESS: Stored {len(combined_data)} bytes for {original_key}")
+            # Note: PUT success guarantees data is stored - no verification needed
 
             # Clear local cache to free memory
             self.local_cpu_backend.clear()

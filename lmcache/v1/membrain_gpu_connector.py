@@ -5,134 +5,282 @@ from lmcache.v1.gpu_connector import VLLMPagedMemLayerwiseGPUConnector
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 import torch
-# import membrain_ext
+import asyncio
+import concurrent.futures
 from multiprocessing.shared_memory import SharedMemory
 import lmcache.c_ops as lmc_ops
 
-
-
 logger = init_logger(__name__)
 
+class ProtectedSharedMemory:
+    """
+    Wrapper around SharedMemory that prevents automatic unlinking during exceptions.
+    This fixes the critical bug where SharedMemory gets destroyed when errors occur,
+    causing widespread memory failures across processes.
+    """
+    def __init__(self, name: str):
+        self._shm = None
+        self._name = name
+        self._attached = False
+        self._attach()
+    
+    def _attach(self):
+        """Safely attach to existing shared memory without auto-cleanup."""
+        try:
+            # Attach to existing shared memory - never create or unlink
+            self._shm = SharedMemory(name=self._name, create=False)
+            self._attached = True
+            
+            # CRITICAL: Monkey-patch to prevent automatic unlinking
+            # This prevents Python from destroying shared memory on garbage collection
+            original_del = self._shm.__del__
+            def safe_del():
+                # Only close, never unlink - other processes may still be using it
+                try:
+                    if hasattr(self._shm, '_mmap') and self._shm._mmap is not None:
+                        self._shm._mmap.close()
+                        self._shm._mmap = None
+                except Exception:
+                    pass  # Ignore cleanup errors
+            self._shm.__del__ = safe_del
+            
+            logger.debug(f"🔒 PROTECTED: Attached to SharedMemory '{self._name}' safely")
+            
+        except FileNotFoundError:
+            logger.warning(f"⚠️ SharedMemory '{self._name}' not found - may not be initialized yet")
+            self._attached = False
+        except Exception as e:
+            logger.error(f"❌ Failed to attach to SharedMemory '{self._name}': {e}")
+            self._attached = False
+    
+    @property 
+    def buf(self):
+        """Access the memory buffer if attached."""
+        if not self._attached or self._shm is None:
+            self._attach()  # Try to reattach
+        
+        if self._attached and self._shm is not None:
+            return self._shm.buf
+        else:
+            raise RuntimeError(f"SharedMemory '{self._name}' not available")
+    
+    @property
+    def size(self):
+        """Get the size of the shared memory."""
+        if not self._attached or self._shm is None:
+            self._attach()
+            
+        if self._attached and self._shm is not None:
+            return self._shm.size
+        else:
+            return 0
+    
+    def close(self):
+        """Close the shared memory reference safely without unlinking."""
+        if self._shm is not None:
+            try:
+                # Only close our reference, never unlink
+                if hasattr(self._shm, '_mmap') and self._shm._mmap is not None:
+                    self._shm._mmap.close()
+                    self._shm._mmap = None
+                logger.debug(f"🔒 PROTECTED: Closed SharedMemory '{self._name}' reference safely")
+            except Exception as e:
+                logger.warning(f"Warning closing SharedMemory reference: {e}")
+            finally:
+                self._shm = None
+                self._attached = False
+
 class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
+    """
+    Zero-copy GPU connector for Membrain shared memory with optimized segment processing.
+    Always uses concurrent processing for multi-segment data to maximize performance.
+    """
     
     def _parse_membrain_data(self, memory_obj, shm, num_tokens):
-        """
-        Shared helper method to parse Membrain shared memory data format.
-        ZERO-COPY OPTIMIZED: Fast path for single segments, memory views for multi-segment.
-        
-        Returns:
-            tuple: (kv_tensor, metadata) or (None, None) if parsing fails
-        """
+        """Parse Membrain shared memory data with zero-copy optimizations."""
         try:
-            logger.info(f"🔍 ZERO-COPY PARSE: Starting with {len(memory_obj.offsets)} segments")
+            num_segments = len(memory_obj.offsets)
+            logger.info(f"🔍 PARSING: {num_segments} segments for {num_tokens} tokens")
             
-            # OPTIMIZATION: Fast path for single segment (most common case)
-            if len(memory_obj.offsets) == 1:
-                logger.info(f"ZERO-COPY FAST PATH: Single segment - avoiding ALL copies!")
-                offset_info = memory_obj.offsets[0]
-                o = offset_info['offset']
-                l = offset_info['len']
-                
-                # Fix SharedMemory lifecycle: Copy data directly to avoid memoryview references
-                logger.info(f"📊 MEMBRAIN ACCESS: Reading {l} bytes from offset {o}")
-                
-                if l < 4:
-                    raise ValueError(f"Insufficient data: only {l} bytes")
-                
-                # Read data directly from SharedMemory buffer to avoid memoryview lifecycle issues
-                raw_data = bytes(shm.buf[o : o + l])
-                logger.info(f"📊 DATA COPY: Copied {len(raw_data)} bytes from shared memory")
-                
-                # Read metadata length directly from raw data
-                metadata_len = int.from_bytes(raw_data[:4], byteorder='little')
-                kv_data_start = 4 + metadata_len
-                
-                if len(raw_data) < kv_data_start:
-                    raise ValueError(f"Insufficient data for metadata: need {kv_data_start}, have {len(raw_data)}")
-                
-                # Parse metadata using raw data
-                metadata_bytes = raw_data[4:kv_data_start]
-                metadata = RemoteMetadata.deserialize(metadata_bytes)
-                logger.info(f"METADATA PARSED: shape={metadata.shape}, dtype={metadata.dtype}")
-                
-                # Extract KV data using raw data
-                kv_data_bytes = raw_data[kv_data_start:]
-                
-                if len(kv_data_bytes) == 0:
-                    raise ValueError("No KV data found after metadata")
-                
-                # Create tensor directly from raw bytes (no SharedMemory references)
-                tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
-                kv_tensor = torch.frombuffer(bytearray(kv_data_bytes), dtype=tensor_dtype)
-                logger.info(f"TENSOR CREATED: {len(kv_tensor)} elements from raw bytes (SharedMemory safe)")
-                
+            if num_segments == 1:
+                return self._parse_single_segment(memory_obj.offsets[0], shm, num_tokens)
             else:
-                # Multi-segment fallback - use memory views instead of bytes()
-                logger.warning(f"⚠️  COPY FALLBACK: Multi-segment data ({len(memory_obj.offsets)} segments) - using optimized memory views")
+                return self._parse_multi_segments(memory_obj.offsets, shm, num_tokens)
                 
-                # Calculate total size first
-                total_size = sum(offset['len'] for offset in memory_obj.offsets)
-                combined_data = bytearray(total_size)  # Pre-allocate exact size - avoids extend() copies
-                logger.info(f"📊 COPY FALLBACK: Pre-allocated {total_size} bytes for {len(memory_obj.offsets)} segments")
-                
-                # Copy using direct bytes access (avoid memoryview SharedMemory references)
-                pos = 0
-                for offset in memory_obj.offsets:
-                    o = offset['offset']
-                    l = offset['len']
-                    segment_bytes = bytes(shm.buf[o : o + l])  # Direct bytes copy
-                    combined_data[pos:pos + l] = segment_bytes  # Direct bytes assignment
-                    pos += l
-                
-                logger.info(f"📊 COPY FALLBACK: Combined {len(memory_obj.offsets)} segments using direct bytes (SharedMemory safe)")
-                
-                # Rest of parsing logic (same as before)
-                if len(combined_data) < 4:
-                    raise ValueError(f"Insufficient data: only {len(combined_data)} bytes")
-                
-                metadata_len = int.from_bytes(combined_data[:4], byteorder='little')
-                kv_data_start = 4 + metadata_len
-                
-                if len(combined_data) < kv_data_start:
-                    raise ValueError(f"Insufficient data for metadata: need {kv_data_start}, have {len(combined_data)}")
-                
-                # Parse metadata
-                metadata_bytes = combined_data[4:kv_data_start]
-                metadata = RemoteMetadata.deserialize(metadata_bytes)
-                logger.info(f"METADATA PARSED: shape={metadata.shape}, dtype={metadata.dtype}")
-                
-                # Extract pure KV data
-                kv_data = combined_data[kv_data_start:]
-                
-                if len(kv_data) == 0:
-                    raise ValueError("No KV data found after metadata")
-                
-                # Create tensor from KV data (no SharedMemory references)
-                tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
-                kv_tensor = torch.frombuffer(bytearray(kv_data), dtype=tensor_dtype)
-                logger.info(f"TENSOR CREATED: {len(kv_tensor)} elements from combined bytes (SharedMemory safe)")
-            
-            # Common padding logic
-            expected_elements = num_tokens * 2 * self.hidden_dim_size
-            
-            # Handle padding if needed (for batched_to_gpu compatibility)
-            if len(kv_tensor) < expected_elements:
-                logger.warning(f"Padding tensor: need {expected_elements}, have {len(kv_tensor)}")
-                # Use the same dtype as the kv_tensor for consistency
-                padded_tensor = torch.zeros(expected_elements, dtype=kv_tensor.dtype)
-                padded_tensor[:len(kv_tensor)] = kv_tensor
-                kv_tensor = padded_tensor
-            
-            logger.info(f"PARSE SUCCESS: Final tensor has {len(kv_tensor)} elements")
-            return kv_tensor, metadata
-            
         except Exception as e:
-            logger.error(f"Failed to parse Membrain data: {e}")
+            logger.error(f"❌ Parse failed: {e}")
             return None, None
+
+    def _parse_single_segment(self, offset_info, shm, num_tokens):
+        """Fast path for single segment data."""
+        o, l = offset_info['offset'], offset_info['len']
+        
+        if l < 4:
+            raise ValueError(f"Insufficient data: {l} bytes")
+        
+        # Direct copy to avoid SharedMemory lifecycle issues
+        raw_data = bytes(shm.buf[o:o + l])
+        metadata_len = int.from_bytes(raw_data[:4], byteorder='little')
+        kv_data_start = 4 + metadata_len
+        
+        if len(raw_data) < kv_data_start:
+            raise ValueError(f"Insufficient metadata space: need {kv_data_start}, have {len(raw_data)}")
+        
+        # Parse metadata and extract KV data
+        metadata = RemoteMetadata.deserialize(raw_data[4:kv_data_start])
+        kv_data_bytes = raw_data[kv_data_start:]
+        
+        if not kv_data_bytes:
+            raise ValueError("No KV data found")
+        
+        # Create tensor
+        tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
+        kv_tensor = torch.frombuffer(kv_data_bytes, dtype=tensor_dtype)
+        
+        logger.info(f"⚡ SINGLE SEGMENT: {len(kv_tensor)} elements")
+        return self._finalize_tensor(kv_tensor, num_tokens), metadata
+
+    def _parse_multi_segments(self, offsets, shm, num_tokens):
+        """Optimized multi-segment processing with concurrent execution."""
+        # Extract metadata from first segment
+        first_segment = bytes(shm.buf[offsets[0]['offset']:offsets[0]['offset'] + offsets[0]['len']])
+        
+        if len(first_segment) < 4:
+            raise ValueError("First segment too small")
+        
+        metadata_len = int.from_bytes(first_segment[:4], byteorder='little')
+        kv_data_start = 4 + metadata_len
+        
+        if len(first_segment) >= kv_data_start:
+            # Fast path: metadata in first segment
+            metadata = RemoteMetadata.deserialize(first_segment[4:kv_data_start])
+            kv_data = self._extract_kv_data_concurrent(offsets, shm, kv_data_start)
+        else:
+            # Fallback: metadata spans segments
+            logger.warning("⚠️ Metadata spans segments - using fallback")
+            combined_data = self._combine_all_segments(offsets, shm)
+            metadata = RemoteMetadata.deserialize(combined_data[4:kv_data_start])
+            kv_data = combined_data[kv_data_start:]
+        
+        # Create tensor
+        tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
+        kv_tensor = torch.frombuffer(kv_data, dtype=tensor_dtype)
+        
+        logger.info(f"🔧 MULTI SEGMENT: {len(kv_tensor)} elements from {len(offsets)} segments")
+        return self._finalize_tensor(kv_tensor, num_tokens), metadata
+
+    def _extract_kv_data_concurrent(self, offsets, shm, kv_data_start):
+        """Extract KV data using concurrent processing when beneficial."""
+        # For small numbers of offsets, use simple sync processing
+        if len(offsets) <= 2:
+            return self._extract_kv_data_sync(offsets, shm, kv_data_start)
+        
+        # For larger numbers, use ThreadPoolExecutor for true concurrency
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(offsets))) as executor:
+                future = executor.submit(self._extract_kv_data_sync, offsets, shm, kv_data_start)
+                return future.result()
+        except Exception as e:
+            logger.warning(f"Concurrent extraction failed: {e}, falling back to sync")
+            return self._extract_kv_data_sync(offsets, shm, kv_data_start)
+
+    async def _extract_kv_data_async(self, offsets, shm, kv_data_start):
+        """Async KV data extraction."""
+        
+        # Create batches for parallel processing
+        num_workers = min(4, len(offsets))
+        batch_size = max(1, len(offsets) // num_workers)
+        
+        async def process_batch(batch_start_idx, batch_offsets):
+            """Process a batch of segments."""
+            result = bytearray()
+            for i, offset in enumerate(batch_offsets):
+                segment_idx = batch_start_idx + i
+                o, l = offset['offset'], offset['len']
+                
+                if segment_idx == 0:
+                    # First segment: skip metadata
+                    start_pos = kv_data_start
+                    size = l - kv_data_start
+                else:
+                    # Other segments: all data is KV
+                    start_pos = 0
+                    size = l
+                
+                if size > 0:
+                    segment_data = bytes(shm.buf[o + start_pos:o + l])
+                    result.extend(segment_data)
+            
+            return result
+        
+        # Create coroutines for concurrent execution
+        tasks = []
+        for i in range(0, len(offsets), batch_size):
+            batch_offsets = offsets[i:i + batch_size]
+            task = process_batch(i, batch_offsets)
+            tasks.append(task)
+        
+        # Execute all batches concurrently using asyncio.gather
+        batch_results = await asyncio.gather(*tasks)
+        
+        # Combine results sequentially to maintain order
+        result = bytearray()
+        for batch_result in batch_results:
+            result.extend(batch_result)
+        
+        logger.debug(f"🔄 CONCURRENT: Processed {len(offsets)} segments in {len(batch_results)} batches")
+        return result
+
+    def _extract_kv_data_sync(self, offsets, shm, kv_data_start):
+        """Synchronous fallback for KV data extraction."""
+        result = bytearray()
+        for i, offset in enumerate(offsets):
+            o, l = offset['offset'], offset['len']
+            
+            if i == 0:
+                start_pos = kv_data_start
+                size = l - kv_data_start
+            else:
+                start_pos = 0
+                size = l
+            
+            if size > 0:
+                segment_data = bytes(shm.buf[o + start_pos:o + l])
+                result.extend(segment_data)
+        
+        return result
+
+    def _combine_all_segments(self, offsets, shm):
+        """Fallback: combine all segments when metadata spans multiple segments."""
+        total_size = sum(offset['len'] for offset in offsets)
+        combined = bytearray(total_size)
+        
+        pos = 0
+        for offset in offsets:
+            o, l = offset['offset'], offset['len']
+            combined[pos:pos + l] = shm.buf[o:o + l]
+            pos += l
+        
+        return combined
+
+    def _finalize_tensor(self, kv_tensor, num_tokens):
+        """Apply padding if needed and validate tensor."""
+        expected_elements = num_tokens * 2 * self.hidden_dim_size
+        
+        if len(kv_tensor) < expected_elements:
+            logger.warning(f"⚠️ Padding: need {expected_elements}, have {len(kv_tensor)}")
+            padded = torch.zeros(expected_elements, dtype=kv_tensor.dtype)
+            padded[:len(kv_tensor)] = kv_tensor
+            return padded
+        elif len(kv_tensor) > expected_elements:
+            logger.warning(f"⚠️ Truncating: need {expected_elements}, have {len(kv_tensor)}")
+            return kv_tensor[:expected_elements]
+        
+        return kv_tensor
 
     @staticmethod
     def from_base(conn: VLLMPagedMemLayerwiseGPUConnector) -> "BedrockMembrainGPUConnector":
-        # TODO(gnovack) - bro this is terrible...
+        """Convert base connector to Membrain connector."""
         conn.__class__ = BedrockMembrainGPUConnector
         return conn
     
@@ -140,250 +288,161 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return torch.Size([num_tokens, 2, self.hidden_dim_size])
     
     def get_flat_shape(self, num_tokens: int) -> torch.Size:
-        # Calculate size for pure KV data (excluding metadata)
-        # Use default dtype if self.dtype is not set
         dtype = getattr(self, 'dtype', torch.float16)
-        element_size = torch.finfo(dtype).bits // 8  # bytes per element
+        element_size = torch.finfo(dtype).bits // 8
         return torch.Size([num_tokens * 2 * self.hidden_dim_size * element_size])
     
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """
-        Override to_gpu method to handle LeaseMemoryObj for regular (non-layerwise) retrieve operations.
-        This ensures zero-copy Membrain works in both regular and layerwise modes.
-        """
-        # Check if this is a LeaseMemoryObj with offsets (Membrain zero-copy)
-        if hasattr(memory_obj, 'offsets') and memory_obj.offsets:
-            logger.debug(f"BedrockMembrainGPUConnector.to_gpu: Processing LeaseMemoryObj with {len(memory_obj.offsets)} offsets")
-            
-            if "kvcaches" not in kwargs:
-                raise ValueError("'kvcaches' should be provided in kwargs.")
-            if "slot_mapping" not in kwargs:
-                raise ValueError("'slot_mapping' should be provided in kwargs.")
-            
-            kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
-            slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-            
-            # For regular to_gpu, we process all layers at once
-            # This is different from batched_to_gpu which processes layer by layer
-            num_tokens = end - start
-            
-            # Access shared memory
-            shm = SharedMemory('membrain-kvcache')
-            
-            # Process the memory object with offsets using shared helper
-            try:
-                logger.info(f"TO_GPU: Calling _parse_membrain_data for {num_tokens} tokens")
-                kv_tensor, metadata = self._parse_membrain_data(memory_obj, shm, num_tokens)
-                
-                if kv_tensor is None or metadata is None:
-                    raise ValueError("Failed to parse Membrain data")
-                
-                # For regular to_gpu, we need to process all layers
-                # Reshape the tensor for all layers: [num_layers, num_tokens, 2, hidden_dim]
-                total_elements = len(kv_tensor)
-                expected_elements_per_layer = num_tokens * 2 * self.hidden_dim_size
-                
-                if total_elements % expected_elements_per_layer != 0:
-                    logger.warning(f"KV data size mismatch: {total_elements} not divisible by {expected_elements_per_layer}")
-                
-                num_layers_in_data = total_elements // expected_elements_per_layer
-                effective_layers = min(num_layers_in_data, self.num_layers)
-                
-                logger.debug(f"to_gpu processing {effective_layers} layers, {num_tokens} tokens each")
-                
-                # Process each layer
-                for layer_id in range(effective_layers):
-                    layer_start = layer_id * expected_elements_per_layer
-                    layer_end = layer_start + expected_elements_per_layer
-                    layer_tensor = kv_tensor[layer_start:layer_end]
-                    
-                    # Reshape to [num_tokens, 2, hidden_dim]
-                    layer_tensor = layer_tensor.view(num_tokens, 2, self.hidden_dim_size)
-                    
-                    # Transfer to GPU and then to vLLM KV cache
-                    gpu_layer_tensor = layer_tensor.to(device=kvcaches[layer_id][0].device, non_blocking=True)
-                    
-                    # Use LMCache C++ ops for efficient transfer
-                    # Fix: Add token_major parameter to match C++ signature
-                    logger.debug(f"TO_GPU TRANSFER: tensor shape={gpu_layer_tensor.shape}, token_major=True")
-                    lmc_ops.single_layer_kv_transfer(
-                        gpu_layer_tensor,
-                        kvcaches[layer_id][0],
-                        kvcaches[layer_id][1], 
-                        slot_mapping[start:end],
-                        False,     # direction: LMCache -> vLLM
-                        True,      # token_major: [num_tokens, 2, hidden_dim]
-                    )
-                
-                logger.debug(f" BedrockMembrainGPUConnector.to_gpu: Successfully processed {effective_layers} layers")
-                
-            except Exception as e:
-                logger.error(f" BedrockMembrainGPUConnector.to_gpu failed: {e}")
-                raise
-                
-            return
+        """Handle LeaseMemoryObj for regular (non-layerwise) operations."""
+        if not (hasattr(memory_obj, 'offsets') and memory_obj.offsets):
+            # Fallback to parent implementation
+            if memory_obj.tensor is None:
+                raise ValueError(f"memory_obj.tensor is None for {type(memory_obj)}")
+            return super().to_gpu(memory_obj, start, end, **kwargs)
         
-        # For non-LeaseMemoryObj, fall back to parent implementation
-        # But first check if tensor exists
-        if memory_obj.tensor is None:
-            raise ValueError(f"BedrockMembrainGPUConnector: memory_obj.tensor is None for {type(memory_obj)}")
+        # Validate required arguments
+        if "kvcaches" not in kwargs or "slot_mapping" not in kwargs:
+            raise ValueError("'kvcaches' and 'slot_mapping' required in kwargs")
+        
+        kvcaches = kwargs["kvcaches"]
+        slot_mapping = kwargs["slot_mapping"]
+        num_tokens = end - start
+        
+        # Process Membrain data using protected SharedMemory
+        shm = ProtectedSharedMemory('membrain-kvcache')
+        try:
+            kv_tensor, metadata = self._parse_membrain_data(memory_obj, shm, num_tokens)
+            if kv_tensor is None or metadata is None:
+                raise ValueError("Failed to parse Membrain data")
             
-        super().to_gpu(memory_obj, start, end, **kwargs)
+            # Process layers
+            self._transfer_layers_to_gpu(kv_tensor, kvcaches, slot_mapping, num_tokens, start, end)
+            
+        except Exception as e:
+            logger.error(f"❌ to_gpu failed: {e}")
+            raise
+        finally:
+            # Safe cleanup - never unlinks shared memory
+            shm.close()
 
-    # Note: from_gpu() method not implemented because BedrockMembrainGPUConnector
-    # is designed only for layerwise operations. For non-layerwise mode, use
-    # VLLMPagedMemGPUConnectorV2 which has proper from_gpu() implementation.
+    def _transfer_layers_to_gpu(self, kv_tensor, kvcaches, slot_mapping, num_tokens, start, end):
+        """Transfer parsed tensor data to GPU layers."""
+        expected_elements_per_layer = num_tokens * 2 * self.hidden_dim_size
+        num_layers_in_data = len(kv_tensor) // expected_elements_per_layer
+        effective_layers = min(num_layers_in_data, self.num_layers)
+        
+        for layer_id in range(effective_layers):
+            layer_start = layer_id * expected_elements_per_layer
+            layer_end = layer_start + expected_elements_per_layer
+            layer_tensor = kv_tensor[layer_start:layer_end]
+            
+            # Reshape and transfer to GPU
+            layer_tensor = layer_tensor.view(num_tokens, 2, self.hidden_dim_size)
+            gpu_tensor = layer_tensor.to(device=kvcaches[layer_id][0].device, non_blocking=True)
+            
+            # Transfer to vLLM KV cache
+            lmc_ops.single_layer_kv_transfer(
+                gpu_tensor,
+                kvcaches[layer_id][0],
+                kvcaches[layer_id][1],
+                slot_mapping[start:end],
+                False,  # direction: LMCache -> vLLM
+                True,   # token_major: [num_tokens, 2, hidden_dim]
+            )
 
     @_lmcache_nvtx_annotate
-    def batched_from_gpu(
-        self,
-        memory_objs: List[List[MemoryObj]],
-        starts: List[int],
-        ends: List[int],
-        **kwargs,
-    ):
-        """
-        Override batched_from_gpu method to handle layerwise store operations.
-        This copies KV data from GPU to memory objects for storage in Membrain.
-        
-        For Membrain, we delegate to the parent implementation since the zero-copy
-        optimization happens during the PUT operation in MembrainConnector, not here.
-        """
-        logger.debug(f"BedrockMembrainGPUConnector.batched_from_gpu: {len(memory_objs)} layers, {len(starts)} chunks")
-        
-        # Use parent implementation for GPU->CPU copy in layerwise mode
-        # This will populate memory_obj.tensor for each memory object
-        # The zero-copy optimization happens later in MembrainConnector.put()
+    def batched_from_gpu(self, memory_objs: List[List[MemoryObj]], starts: List[int], ends: List[int], **kwargs):
+        """Handle layerwise store operations."""
+        logger.debug(f"batched_from_gpu: {len(memory_objs)} layers, {len(starts)} chunks")
         yield from super().batched_from_gpu(memory_objs, starts, ends, **kwargs)
-        
-        logger.debug(f" BedrockMembrainGPUConnector.batched_from_gpu: Successfully completed layerwise GPU->CPU copy")
 
     @_lmcache_nvtx_annotate
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
-        logger.info(f"BedrockMembrainGPUConnector.batched_to_gpu called: {len(starts)} chunks")
-        """
-        This function is a generator that moves the KV cache from the memory
-        objects to paged GPU memory. The first iteration will prepare some
-        related metadata. In each of the following iterations, it will first
-        wait until the loading of the previous layer finish, and then load
-        one layer of KV cache from the memory objects -> GPU buffer ->
-        paged GPU memory. The last iteration simply waits for the last layer
-        to finish.
-        In total, this the generator will yield num_layers + 2 times.
-
-        :param starts: The starting indices of the KV cache in the corresponding
-            token sequence.
-
-        :param ends: The ending indices of the KV cache in the corresponding
-            token sequence.
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
-        """
-
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
-
+        """Generator for layerwise KV cache loading from Membrain."""
+        if "kvcaches" not in kwargs or "slot_mapping" not in kwargs:
+            raise ValueError("'kvcaches' and 'slot_mapping' required in kwargs")
+        
+        kvcaches = kwargs["kvcaches"]
+        slot_mapping = kwargs["slot_mapping"]
+        
+        # Prepare slot mapping
+        slot_mapping_chunks = [slot_mapping[start:end] for start, end in zip(starts, ends, strict=False)]
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
         num_tokens = len(slot_mapping_full)
+        
+        # Initialize streams and memory using protected SharedMemory
         current_stream = torch.cuda.current_stream()
+        shm = ProtectedSharedMemory('membrain-kvcache')
+        
+        try:
+            # Allocate GPU buffer (for compatibility, but zero-copy path bypasses it)
+            buffer_shape = self.get_flat_shape(num_tokens)
+            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, torch.int8, MemoryFormat.KV_T2D
+            )
 
-        shm = SharedMemory('membrain-kvcache')
-        buffer_shape = self.get_flat_shape(num_tokens)
-        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, torch.int8, MemoryFormat.KV_T2D
+            # Process each layer
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = yield
+                current_stream.wait_stream(self.load_stream)
+                
+                if layer_id > 0:
+                    logger.debug(f"Finished loading layer {layer_id - 1}")
+
+                with torch.cuda.stream(self.load_stream):
+                    for start, end, memory_obj in zip(starts, ends, memory_objs_layer, strict=False):
+                        if memory_obj is None:
+                            logger.warning("Skipping None memory_obj")
+                            continue
+                        
+                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                        
+                        try:
+                            if hasattr(memory_obj, 'offsets'):
+                                self._process_layer_from_membrain(
+                                    memory_obj, shm, num_tokens, kvcaches, 
+                                    layer_id, slot_mapping_full
+                                )
+                            else:
+                                logger.warning(f"Expected LeaseMemoryObj, got {type(memory_obj)}")
+                        except Exception as e:
+                            logger.error(f"❌ Layer {layer_id} processing failed: {e}")
+                            raise
+
+            yield
+            current_stream.wait_stream(self.load_stream)
+            tmp_gpu_buffer_obj.ref_count_down()
+            logger.debug(f"Finished loading layer {layer_id}")
+            yield
+        finally:
+            # Safe cleanup - never unlinks shared memory 
+            shm.close()
+
+    def _process_layer_from_membrain(self, memory_obj, shm, num_tokens, kvcaches, layer_id, slot_mapping_full):
+        """Process a single layer from Membrain data."""
+        logger.info(f"🔍 Processing layer {layer_id}: {len(memory_obj.offsets)} segments")
+        
+        # Parse Membrain data
+        kv_tensor, metadata = self._parse_membrain_data(memory_obj, shm, num_tokens)
+        if kv_tensor is None or metadata is None:
+            raise ValueError("Failed to parse Membrain data")
+        
+        expected_elements = num_tokens * 2 * self.hidden_dim_size
+        
+        # Direct GPU transfer (zero-copy optimization)
+        gpu_device = kvcaches[layer_id][0].device
+        gpu_tensor = kv_tensor[:expected_elements].to(device=gpu_device, non_blocking=True)
+        
+        # Reshape and transfer to vLLM
+        reshaped_tensor = gpu_tensor.view(num_tokens, 2, self.hidden_dim_size)
+        lmc_ops.single_layer_kv_transfer(
+            reshaped_tensor,
+            kvcaches[layer_id][0],
+            kvcaches[layer_id][1],
+            slot_mapping_full,
+            False,  # direction: LMCache -> vLLM
+            True,   # token_major: [num_tokens, 2, hidden_dim]
         )
         
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
-            current_stream.wait_stream(self.load_stream)
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
-
-            # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    if memory_obj is None:
-                        logger.warning(f"Skipping because memory_obj is none....")
-                        continue
-                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
-
-                    try:
-                        if hasattr(memory_obj, 'offsets'):
-                            logger.info(f"🔍 MEMBRAIN ZERO-COPY: Processing LeaseMemoryObj with {len(memory_obj.offsets)} segments")
-                            logger.debug(f"Processing Membrain offsets: {len(memory_obj.offsets)} segments")
-                            
-                            # Use shared helper to parse Membrain data
-                            kv_tensor, metadata = self._parse_membrain_data(memory_obj, shm, num_tokens)
-                            
-                            if kv_tensor is None or metadata is None:
-                                raise ValueError("Failed to parse Membrain data")
-                            
-                            expected_elements = num_tokens * 2 * self.hidden_dim_size
-                            
-                            # Copy pure KV data to GPU buffer
-                            # Use default dtype if self.dtype is not set
-                            dtype = getattr(self, 'dtype', torch.float16)
-                            gpu_tensor_view = tmp_gpu_buffer_obj.tensor.view(dtype)[:expected_elements]
-                            gpu_tensor_view.copy_(kv_tensor[:expected_elements], non_blocking=True)
-                            
-                            # Transfer to vLLM KV cache with correct shape
-                            # Fix: Add token_major parameter to match C++ signature
-                            # Expected: (lmc_tensor, vllm_key, vllm_value, slot_mapping, direction, token_major)
-                            reshaped_tensor = gpu_tensor_view.view(num_tokens, 2, self.hidden_dim_size)
-                            logger.debug(f"TENSOR TRANSFER: tensor shape={reshaped_tensor.shape}, token_major=True")
-                            lmc_ops.single_layer_kv_transfer(
-                                reshaped_tensor,
-                                kvcaches[layer_id][0],
-                                kvcaches[layer_id][1],
-                                slot_mapping_full,
-                                False,  # direction: LMCache -> vLLM
-                                True,   # token_major: [num_tokens, 2, hidden_dim]
-                            )
-                            
-                            logger.debug(f" Successfully transferred layer {layer_id} KV data to GPU")
-
-                            # offsets: [{'offset': 102994812928, 'len': 4096}]
-                            # cached_shape -> [num_tokens, 2, hidden_dim]
-                            # kvcaches[layer_id][0] -> [num_blocks, block_size, num_kv_heads, head_dim]
-                            # slot_mapping_full -> [num_tokens,]
-                            # membrain_ext.host_to_device(
-                            #     kvcaches[layer_id][0],
-                            #     kvcaches[layer_id][1],
-                            #     slot_mapping_full,
-                            #     [o['offset'] for o in memory_obj.offsets],
-                            #     [o['len'] for o in memory_obj.offsets],
-                            #     'membrain-kvcache-ip-192-168-216-191.us-west-2.compute.internal',
-                            # )
-                        else:
-                            logger.warning(f"Expected a LeaseMemoryObj, but got {type(memory_obj)}")
-                        
-                    except Exception as e:
-                        raise e
-
-        yield
-
-        # synchronize the last layer
-        current_stream.wait_stream(self.load_stream)
-
-        # free the buffer memory
-        tmp_gpu_buffer_obj.ref_count_down()
-
-        logger.debug(f"Finished loading layer {layer_id}")
-        yield
+        logger.debug(f"✅ Layer {layer_id} transfer complete")

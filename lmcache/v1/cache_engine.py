@@ -698,7 +698,8 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 self.storage_manager.batched_unpin(keys_layer)
 
             for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
+                if mem_obj is not None:
+                    mem_obj.ref_count_down()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
