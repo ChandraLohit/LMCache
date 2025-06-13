@@ -14,7 +14,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 import threading
 
 # Third Party
@@ -32,16 +32,25 @@ import vllm.envs as envs
 import zmq
 
 # First Party
+from lmcache.config import LMCacheEngineConfig as Config
+from lmcache.integration.vllm.lmcache_direct_lookup_client import (
+    LMCacheDirectLookupClient,
+)
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
     lmcache_get_config,
 )
-from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
+from lmcache.integration.vllm.vllm_adapter import (
+    get_or_init_lmcache_engine,
+)
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
+from lmcache.v1.config import (
+    LMCacheEngineConfig as V1Config,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -392,18 +401,29 @@ class LMCacheConnectorV1Impl:
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
 
         config = lmcache_get_config()
+        self.is_direct_remote_access = self._is_direct_remote_access(config)
         self.layerwise_retrievers = []
-        if role == KVConnectorRole.SCHEDULER:
-            self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
-            self._requests_in_step: dict[str, Request] = {}
-        else:
-            self.lmcache_engine = init_lmcache_engine(
+
+        # Initialize this regardless of role to avoid AttributeError
+        self._requests_in_step: dict[str, Request] = {}
+
+        # Determine if we need to initialize lmcache_engine
+        if role != KVConnectorRole.SCHEDULER or self.is_direct_remote_access:
+            self.lmcache_engine = get_or_init_lmcache_engine(
                 vllm_config.model_config,
                 vllm_config.parallel_config,
                 vllm_config.cache_config,
                 vllm_config.scheduler_config,
             )
 
+        # Handle lookup client/server setup based on role
+        if role == KVConnectorRole.SCHEDULER:
+            if self.is_direct_remote_access:
+                logger.info("Using LMCacheDirectLookupClient, skipping RPC server")
+                self.lookup_client = LMCacheDirectLookupClient(self.lmcache_engine)
+            else:
+                self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
+        else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
 
@@ -417,7 +437,10 @@ class LMCacheConnectorV1Impl:
             # NOTE: Only create the KV lookup API server on worker rank 0
             # when there are multiple workers
             assert self.lmcache_engine is not None
-            if vllm_config.parallel_config.rank == 0:
+            if (
+                vllm_config.parallel_config.rank == 0
+                and not self.is_direct_remote_access
+            ):
                 self.lookup_server = LMCacheLookupServer(
                     self.lmcache_engine, role, is_tp, vllm_config
                 )
@@ -463,6 +486,15 @@ class LMCacheConnectorV1Impl:
                 self.kv_caches[layer_name] = attn_layer.kv_cache[
                     forward_context.virtual_engine
                 ]
+
+    def _is_direct_remote_access(self, config: Union[Config, V1Config]) -> bool:
+        # Handle various representations of zero: 0, 0.0, or very small values
+        is_zero_cpu = (isinstance(config.max_local_cpu_size, (int, float))
+                       and abs(config.max_local_cpu_size) < 0.001)
+        has_remote = ((config.remote_url is not None and config.remote_url.strip() != "")
+                      or (config.membrain_url is not None and config.membrain_url.strip() != ""))
+
+        return is_zero_cpu and has_remote
 
     ####################
     # Worker side APIs

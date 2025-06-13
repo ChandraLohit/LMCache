@@ -109,6 +109,18 @@ class LMCacheEngineConfig:
     # Size of CuFile Buffer in MiB
     cufile_buffer_size: Optional[int] = None
 
+    # (Optional) Membrain KV cache daemon configurations
+    # URL of the Membrain daemon (e.g., "http://localhost:9200")
+    membrain_url: Optional[str] = None
+    # Optional name for shared memory segment
+    shared_memory_name: Optional[str] = None
+    # Bucket name for priority/organization (default: "lmcache")
+    membrain_bucket: Optional[str] = None
+    # Timeout for Membrain operations in milliseconds (default: 5000)
+    membrain_timeout_ms: Optional[int] = None
+    # Size of Membrain buffer in MiB (similar to cufile_buffer_size)
+    membrain_buffer_size: Optional[int] = None
+
     # The extra config
     extra_config: Optional[dict] = None
 
@@ -154,6 +166,11 @@ class LMCacheEngineConfig:
         weka_path: Optional[str] = None,
         gds_path: Optional[str] = None,
         cufile_buffer_size: Optional[int] = None,
+        membrain_url: Optional[str] = None,
+        shared_memory_name: Optional[str] = None,
+        membrain_bucket: Optional[str] = None,
+        membrain_timeout_ms: Optional[int] = None,
+        membrain_buffer_size: Optional[int] = None,
         extra_config: Optional[dict] = None,
         save_unfull_chunk: bool = True,
         blocking_timeout_secs: int = 10,
@@ -192,6 +209,11 @@ class LMCacheEngineConfig:
             weka_path,
             gds_path,
             cufile_buffer_size,
+            membrain_url,
+            shared_memory_name,
+            membrain_bucket,
+            membrain_timeout_ms,
+            membrain_buffer_size,
             extra_config,
             save_unfull_chunk,
             blocking_timeout_secs,
@@ -356,6 +378,12 @@ class LMCacheEngineConfig:
         gds_path = config.get("gds_path", None)
         cufile_buffer_size = config.get("cufile_buffer_size", None)
 
+        membrain_url = config.get("membrain_url", None)
+        shared_memory_name = config.get("shared_memory_name", None)
+        membrain_bucket = config.get("membrain_bucket", None)
+        membrain_timeout_ms = config.get("membrain_timeout_ms", None)
+        membrain_buffer_size = config.get("membrain_buffer_size", None)
+
         save_unfull_chunk = config.get("save_unfull_chunk", True)
 
         blocking_timeout_secs = config.get("blocking_timeout_secs", 10)
@@ -404,6 +432,11 @@ class LMCacheEngineConfig:
                 weka_path,
                 gds_path,
                 cufile_buffer_size,
+                membrain_url,
+                shared_memory_name,
+                membrain_bucket,
+                membrain_timeout_ms,
+                membrain_buffer_size,
                 extra_config,
                 save_unfull_chunk,
                 blocking_timeout_secs,
@@ -587,6 +620,30 @@ class LMCacheEngineConfig:
                 config.cufile_buffer_size,
             )
         )
+        config.membrain_url = parse_env(
+            get_env_name("membrain_url"),
+            config.membrain_url,
+        )
+        config.shared_memory_name = parse_env(
+            get_env_name("shared_memory_name"),
+            config.shared_memory_name,
+        )
+        config.membrain_bucket = parse_env(
+            get_env_name("membrain_bucket"),
+            config.membrain_bucket,
+        )
+        config.membrain_timeout_ms = to_int(
+            parse_env(
+                get_env_name("membrain_timeout_ms"),
+                config.membrain_timeout_ms,
+            )
+        )
+        config.membrain_buffer_size = to_int(
+            parse_env(
+                get_env_name("membrain_buffer_size"),
+                config.membrain_buffer_size,
+            )
+        )
         config.extra_config = to_dict(parse_env(get_env_name("extra_config"), None))
         config.save_unfull_chunk = to_bool(
             parse_env(get_env_name("save_unfull_chunk"), config.save_unfull_chunk)
@@ -676,6 +733,11 @@ class LMCacheEngineConfig:
             "nixl_enable_gc": self.nixl_enable_gc,
             "weka_path": self.weka_path,
             "gds_path": self.gds_path,
+            "membrain_url": self.membrain_url,
+            "shared_memory_name": self.shared_memory_name,
+            "membrain_bucket": self.membrain_bucket,
+            "membrain_timeout_ms": self.membrain_timeout_ms,
+            "membrain_buffer_size": self.membrain_buffer_size,
             "extra_config": self.extra_config,
             "save_unfull_chunk": self.save_unfull_chunk,
             "blocking_timeout_secs": self.blocking_timeout_secs,
