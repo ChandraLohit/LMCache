@@ -89,9 +89,10 @@ class CacheEngineKey:
         )
 
     def to_string(self):
+        # FIXED: Remove worker_id from cache key to enable shared caching across workers
         return (
             f"{self.fmt}@{self.model_name}@{self.world_size}"
-            f"@{self.worker_id}@{self.chunk_hash}"
+            f"@{self.chunk_hash}"
         )
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
@@ -125,11 +126,19 @@ class CacheEngineKey:
     @staticmethod
     def from_string(s):
         parts = s.split("@")
-        if len(parts) != 5:
-            raise ValueError(f"Invalid key string: {s}")
-        return CacheEngineKey(
-            parts[0], parts[1], int(parts[2]), int(parts[3]), parts[4]
-        )
+        # Handle both old format (5 parts with worker_id) and new format (4 parts without worker_id)
+        if len(parts) == 5:
+            # Old format: fmt@model@world_size@worker_id@chunk_hash  
+            return CacheEngineKey(
+                parts[0], parts[1], int(parts[2]), int(parts[3]), parts[4]
+            )
+        elif len(parts) == 4:
+            # New format: fmt@model@world_size@chunk_hash (worker_id = 0 for compatibility)
+            return CacheEngineKey(
+                parts[0], parts[1], int(parts[2]), 0, parts[3]
+            )
+        else:
+            raise ValueError(f"Invalid key string: {s} (expected 4 or 5 parts, got {len(parts)})")
 
     def to_dict(self):
         # Note(Kuntai): this is used for serializing CacheEngineKey via msgpack.
@@ -172,10 +181,14 @@ class LayerCacheEngineKey(CacheEngineKey):
         )
 
     def to_string(self):
-        return (
+        # FIXED: Remove worker_id from cache key to enable shared caching across workers
+        key_str = (
             f"{self.fmt}@{self.model_name}@{self.world_size}"
-            f"@{self.worker_id}@{self.chunk_hash}@{self.layer_id}"
+            f"@{self.chunk_hash}@{self.layer_id}"
         )
+        # Debug key generation (worker_id kept for internal use but not in key string)
+        # Note: worker_id is still part of the object but not the serialized key
+        return key_str
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
@@ -196,16 +209,29 @@ class LayerCacheEngineKey(CacheEngineKey):
     @staticmethod
     def from_string(s):
         parts = s.split("@")
-        if len(parts) != 6:
-            raise ValueError(f"Invalid key string: {s}")
-        return LayerCacheEngineKey(
-            parts[0],
-            parts[1],
-            int(parts[2]),
-            int(parts[3]),
-            parts[4],
-            int(parts[5]),
-        )
+        # Handle both old format (6 parts with worker_id) and new format (5 parts without worker_id)
+        if len(parts) == 6:
+            # Old format: fmt@model@world_size@worker_id@chunk_hash@layer_id
+            return LayerCacheEngineKey(
+                parts[0],
+                parts[1],
+                int(parts[2]),
+                int(parts[3]),
+                parts[4],
+                int(parts[5]),
+            )
+        elif len(parts) == 5:
+            # New format: fmt@model@world_size@chunk_hash@layer_id (worker_id = 0 for compatibility)
+            return LayerCacheEngineKey(
+                parts[0],
+                parts[1],
+                int(parts[2]),
+                0,  # worker_id = 0 for compatibility
+                parts[3],
+                int(parts[4]),
+            )
+        else:
+            raise ValueError(f"Invalid LayerCacheEngineKey string: {s} (expected 5 or 6 parts, got {len(parts)})")
 
 
 ##### NVTX annotation #####

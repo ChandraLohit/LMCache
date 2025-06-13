@@ -98,7 +98,8 @@ class ChunkedTokenDatabase(TokenDatabase):
             tokens_bytes = tokens.cpu().to(torch.uint32).numpy().tobytes()
         elif isinstance(tokens, list):
             tokens_bytes = array.array("I", tokens).tobytes()
-        return hashlib.sha256(prefix_hash.encode("ascii") + tokens_bytes).hexdigest()
+        chunk_hash = hashlib.sha256(prefix_hash.encode("ascii") + tokens_bytes).hexdigest()
+        return chunk_hash
 
     def _chunk_tokens(
         self,
