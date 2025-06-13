@@ -107,6 +107,23 @@ def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
         return True
 
 
+def get_or_init_lmcache_engine(
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
+        scheduler_config: SchedulerConfig,) -> LMCacheEngine:
+    if LMCacheEngineBuilder.get(ENGINE_NAME) is not None:
+        # Return existing cache engine when tensor parallel is not used
+        return LMCacheEngineBuilder.get(ENGINE_NAME)
+    else:
+        return init_lmcache_engine(
+            model_config,
+            parallel_config,
+            cache_config,
+            scheduler_config,
+        )
+
+
 def init_lmcache_engine(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
