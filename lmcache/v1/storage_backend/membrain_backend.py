@@ -122,15 +122,21 @@ class MembrainBackend(StorageBackendInterface):
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Check if key exists in Membrain cache."""
+        logger.info(f"MembrainBackend: Checking contains() for key {key}")
+        
         # First check local cache metadata
         with self.cache_lock:
             if key in self.cache_metadata:
+                logger.info(f"MembrainBackend: Key {key} found in local metadata cache")
                 return True
         
         # Check with Membrain daemon via HTTP
-        return asyncio.run_coroutine_threadsafe(
+        logger.info(f"MembrainBackend: Key {key} not in local cache, checking Membrain daemon")
+        result = asyncio.run_coroutine_threadsafe(
             self._async_contains(key, pin), self.loop
         ).result()
+        logger.info(f"MembrainBackend: Membrain daemon contains() result for key {key}: {result}")
+        return result
 
     async def _async_contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Async check if key exists in Membrain."""
@@ -189,9 +195,11 @@ class MembrainBackend(StorageBackendInterface):
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}"
+            logger.info(f"MembrainBackend: Starting PUT operation for key {key} to URL {url}")
             
             # Convert memory object to bytes
             data = self._memory_obj_to_bytes(memory_obj)
+            logger.info(f"MembrainBackend: Serialized {len(data)} bytes for key {key}")
             
             async with aiohttp.ClientSession() as session:
                 async with session.put(
@@ -199,6 +207,7 @@ class MembrainBackend(StorageBackendInterface):
                     data=data,
                     timeout=aiohttp.ClientTimeout(total=self.timeout_ms/1000.0)
                 ) as response:
+                    logger.info(f"MembrainBackend: PUT HTTP response for key {key}: status={response.status}")
                     if response.status == 200:
                         # Store metadata locally
                         metadata = MembrainCacheMetadata(
@@ -211,12 +220,12 @@ class MembrainBackend(StorageBackendInterface):
                         )
                         with self.cache_lock:
                             self.cache_metadata[key] = metadata
-                        logger.debug(f"Successfully stored key {key}")
+                        logger.info(f"MembrainBackend: Successfully stored key {key}")
                     else:
-                        logger.error(f"Failed to store key {key}: {response.status}")
+                        logger.error(f"MembrainBackend: Failed to store key {key}: HTTP {response.status}")
                         
         except Exception as e:
-            logger.error(f"Error storing key {key}: {e}")
+            logger.error(f"MembrainBackend: CRITICAL - Exception during PUT for key {key}: {type(e).__name__}: {e}")
         finally:
             memory_obj.ref_count_down()
             with self.put_lock:
@@ -243,21 +252,37 @@ class MembrainBackend(StorageBackendInterface):
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Blocking GET operation from Membrain."""
-        return asyncio.run_coroutine_threadsafe(
-            self._async_get_blocking(key), self.loop
-        ).result()
+        logger.info(f"MembrainBackend: Starting GET operation for key {key}")
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._async_get_blocking(key), self.loop
+            ).result()
+            if result is not None:
+                logger.info(f"MembrainBackend: GET operation successful for key {key}")
+            else:
+                logger.warning(f"MembrainBackend: GET operation failed for key {key}")
+            return result
+        except Exception as e:
+            logger.error(f"MembrainBackend: GET operation exception for key {key}: {e}")
+            return None
 
     async def _async_get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Async blocking GET operation."""
+        logger.info(f"MembrainBackend: Acquiring lease for key {key}")
         # First acquire lease
         lease_info = await self._acquire_lease(key)
         if lease_info is None:
+            logger.warning(f"MembrainBackend: Failed to acquire lease for key {key}")
             return None
         
+        logger.info(f"MembrainBackend: Lease acquired {lease_info.lease_id}, creating memory object")
         try:
-            return await self._create_memory_obj_from_lease(key, lease_info)
+            result = await self._create_memory_obj_from_lease(key, lease_info)
+            if result is not None:
+                logger.info(f"MembrainBackend: Memory object created successfully for key {key}")
+            return result
         except Exception as e:
-            logger.error(f"Failed to create memory object for key {key}: {e}")
+            logger.error(f"MembrainBackend: Failed to create memory object for key {key}: {e}")
             # Release lease on failure
             await self._release_lease(lease_info.lease_id)
             return None
@@ -291,7 +316,7 @@ class MembrainBackend(StorageBackendInterface):
                         with self.lease_lock:
                             self.active_leases[lease_info.lease_id] = lease_info
                         
-                        logger.debug(f"Acquired lease {lease_info.lease_id} for key {key}")
+                        logger.info(f"MembrainBackend: Acquired lease {lease_info.lease_id} for key {key}, total_size={lease_info.total_size}, offsets={len(lease_info.offsets)}")
                         return lease_info
                     elif response.status == 404:
                         logger.debug(f"Key {key} not found for lease acquisition")
@@ -301,7 +326,7 @@ class MembrainBackend(StorageBackendInterface):
                         return None
                         
         except Exception as e:
-            logger.error(f"Error acquiring lease for key {key}: {e}")
+            logger.error(f"MembrainBackend: CRITICAL - Exception during lease acquisition for key {key}: {type(e).__name__}: {e}")
             return None
 
     async def _release_lease(self, lease_id: str) -> bool:
@@ -415,7 +440,7 @@ class MembrainBackend(StorageBackendInterface):
                 target_tensor = reconstructed_tensor.to(memory_obj.tensor.device)
                 memory_obj.tensor.copy_(target_tensor)
                 
-                logger.debug(f"Successfully reconstructed tensor for key {key}: shape={shape}, dtype={original_dtype}, format={memory_format}")
+                logger.info(f"MembrainBackend: Successfully reconstructed tensor for key {key}: shape={shape}, dtype={original_dtype}, format={memory_format}")
                 return memory_obj
             else:
                 logger.error(f"Allocated memory object has no tensor for key {key}")
@@ -443,14 +468,14 @@ class MembrainBackend(StorageBackendInterface):
                 )
                 self.shared_memory_map = memoryview(self.shared_memory_obj.buf)
                 
-                logger.debug(f"Successfully opened shared memory: {self.shared_memory_name} (size: {len(self.shared_memory_map)} bytes)")
+                logger.info(f"MembrainBackend: Successfully opened shared memory: {self.shared_memory_name} (size: {len(self.shared_memory_map)} bytes)")
                 return True
                 
             except FileNotFoundError:
-                logger.error(f"Shared memory segment '{self.shared_memory_name}' not found. Is Membrain daemon running?")
+                logger.error(f"MembrainBackend: CRITICAL - Shared memory segment '{self.shared_memory_name}' not found. Is Membrain daemon running and creating shared memory?")
                 return False
             except Exception as e:
-                logger.error(f"Failed to initialize shared memory: {e}")
+                logger.error(f"MembrainBackend: CRITICAL - Failed to initialize shared memory: {e}")
                 return False
 
     def pin(self, key: CacheEngineKey) -> bool:
@@ -583,5 +608,5 @@ class MembrainBackend(StorageBackendInterface):
         # Format: [4 bytes metadata size][metadata json][tensor bytes]
         result = metadata_size.to_bytes(4, 'little') + metadata_json + tensor_bytes
         
-        logger.debug(f"Serialized tensor: shape={original_shape}, dtype={original_dtype}, format={original_format}, size={len(result)} bytes")
+        logger.info(f"MembrainBackend: Serialized tensor: shape={original_shape}, dtype={original_dtype}, format={original_format}, size={len(result)} bytes")
         return result
