@@ -715,6 +715,10 @@ class LMCacheEngineBuilder:
             assert config.cufile_buffer_size is not None
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
+        if config.membrain_url is not None:
+            assert config.membrain_buffer_size is not None, "Need to specify membrain_buffer_size for MembrainBackend"
+            return MixedMemoryAllocator(config.membrain_buffer_size * 1024**2)
+
         max_local_cpu_size = config.max_local_cpu_size
         return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
 
