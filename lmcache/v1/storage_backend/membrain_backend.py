@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import asyncio
 import json
 import mmap
+import numpy as np
 import os
 import threading
 import time
@@ -146,6 +147,7 @@ class MembrainBackend(StorageBackendInterface):
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as response:
+                    logger.info(f"MembrainBackend: CONTAINS HTTP {response.status} for key {key}")
                     if response.status == 200:
                         locations_data = await response.json()
                         # Cache the metadata for future use
@@ -239,8 +241,10 @@ class MembrainBackend(StorageBackendInterface):
 
     async def _async_prefetch(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Async prefetch - acquire lease for the key."""
+        logger.info(f"MembrainBackend: Starting ASYNC PREFETCH operation for key {key}")
         lease_info = await self._acquire_lease(key)
         if lease_info is None:
+            logger.warning(f"MembrainBackend: ASYNC PREFETCH failed to acquire lease for key {key}")
             return None
         
         # For prefetch, we don't immediately load data, just acquire the lease
@@ -248,7 +252,21 @@ class MembrainBackend(StorageBackendInterface):
             if key in self.cache_metadata:
                 self.cache_metadata[key].lease_info = lease_info
         
-        return await self._create_memory_obj_from_lease(key, lease_info)
+        logger.info(f"MembrainBackend: ASYNC PREFETCH creating memory object for key {key}")
+        result = await self._create_memory_obj_from_lease(key, lease_info)
+        
+        # Always release the lease after use (success or failure)
+        release_success = await self._release_lease(lease_info.lease_id)
+        if release_success:
+            logger.info(f"MembrainBackend: Released lease {lease_info.lease_id} for key {key}")
+        else:
+            logger.warning(f"MembrainBackend: Failed to release lease {lease_info.lease_id} for key {key}")
+        
+        if result is not None:
+            logger.info(f"MembrainBackend: ASYNC PREFETCH completed successfully for key {key}")
+        else:
+            logger.error(f"MembrainBackend: ASYNC PREFETCH failed to create memory object for key {key}")
+        return result
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Blocking GET operation from Membrain."""
@@ -289,7 +307,13 @@ class MembrainBackend(StorageBackendInterface):
 
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
         """Non-blocking GET operation."""
-        return self.submit_prefetch_task(key)
+        logger.info(f"MembrainBackend: Starting NON-BLOCKING GET operation for key {key}")
+        future = self.submit_prefetch_task(key)
+        if future is not None:
+            logger.info(f"MembrainBackend: NON-BLOCKING GET future created for key {key}")
+        else:
+            logger.error(f"MembrainBackend: NON-BLOCKING GET failed to create future for key {key}")
+        return future
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Acquire a lease for the given key from Membrain daemon."""
@@ -305,6 +329,7 @@ class MembrainBackend(StorageBackendInterface):
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=self.timeout_ms/1000.0)
                 ) as response:
+                    logger.info(f"MembrainBackend: LEASE HTTP {response.status} for key {key}")
                     if response.status == 200:
                         lease_data = await response.json()
                         lease_info = LeaseInfo(
@@ -339,6 +364,7 @@ class MembrainBackend(StorageBackendInterface):
                     url,
                     timeout=aiohttp.ClientTimeout(total=2.0)
                 ) as response:
+                    logger.info(f"MembrainBackend: RELEASE HTTP {response.status} for lease {lease_id}")
                     success = response.status == 200
                     if success:
                         with self.lease_lock:
@@ -405,9 +431,6 @@ class MembrainBackend(StorageBackendInterface):
             # Parse dtype strings
             original_dtype = getattr(torch, original_dtype_str.replace('torch.', ''))
             serialized_dtype = getattr(torch, serialized_dtype_str.replace('torch.', ''))
-            
-            # Reconstruct tensor from bytes
-            import numpy as np
             
             # Convert bytes to numpy array with serialized dtype
             if serialized_dtype == torch.float32:
