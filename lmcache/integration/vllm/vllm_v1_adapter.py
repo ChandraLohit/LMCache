@@ -388,8 +388,10 @@ class LMCacheConnectorV1Impl:
 
         if role == KVConnectorRole.SCHEDULER:
             if self.is_direct_remote_access:
+                logger.info("Using LMCacheDirectLookupClient, skipping RPC")
                 self.lookup_client = LMCacheDirectLookupClient(self.lmcache_engine)
             else:
+                logger.info("Using LMCacheLookupClient, using RPC for local access")
                 self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
         else:
             self.use_layerwise = config.use_layerwise
