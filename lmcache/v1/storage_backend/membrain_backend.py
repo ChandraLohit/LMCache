@@ -13,18 +13,14 @@
 # limitations under the License.
 
 # Standard
-from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import asyncio
 import json
-import mmap
 import numpy as np
-import os
 import threading
-import time
 
 # Third Party
 import aiohttp
@@ -40,24 +36,103 @@ from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 logger = init_logger(__name__)
 
 
+class DTypeManager:
+    """Centralized dtype management for MembrainBackend serialization.
+    
+    Handles torch.dtype <-> numpy.dtype conversions and serialization compatibility.
+    Single source of truth for all dtype-related operations.
+    """
+    
+    # Direct serializable dtypes (no conversion needed for numpy compatibility)
+    DIRECT_SERIALIZABLE = {
+        torch.float32: np.float32,
+        torch.float16: np.float16,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
+        torch.int16: np.int16,
+        torch.int8: np.int8,
+        torch.uint8: np.uint8,
+        torch.bool: np.bool_,
+    }
+    
+    # Dtypes that require conversion for numpy/serialization compatibility
+    CONVERSION_REQUIRED = {
+        torch.bfloat16: torch.float32,     # bfloat16 -> float32 (numpy doesn't support bfloat16)
+        torch.float8_e4m3fn: torch.float32, # float8 -> float32
+        torch.float8_e5m2: torch.float32,  # float8 -> float32
+        torch.complex64: torch.float32,    # complex -> float32 (flatten to real)
+        torch.complex128: torch.float32,   # complex -> float32
+    }
+    
+    @classmethod
+    def get_serialization_info(cls, original_dtype: torch.dtype) -> Tuple[torch.dtype, np.dtype]:
+        """Get serialization dtype and corresponding numpy dtype for storage.
+        
+        Args:
+            original_dtype: The original tensor dtype
+            
+        Returns:
+            Tuple of (serialized_torch_dtype, numpy_dtype_for_storage)
+        """
+        if original_dtype in cls.DIRECT_SERIALIZABLE:
+            # Can serialize directly without conversion
+            numpy_dtype = cls.DIRECT_SERIALIZABLE[original_dtype]
+            return original_dtype, numpy_dtype
+        elif original_dtype in cls.CONVERSION_REQUIRED:
+            # Requires conversion for serialization
+            serialized_dtype = cls.CONVERSION_REQUIRED[original_dtype]
+            numpy_dtype = cls.DIRECT_SERIALIZABLE[serialized_dtype]
+            return serialized_dtype, numpy_dtype
+        else:
+            # Unknown dtype - fallback to float32 with warning
+            logger.warning(f"Unknown dtype {original_dtype}, falling back to float32 for serialization")
+            return torch.float32, np.float32
+    
+    @classmethod
+    def get_numpy_dtype_from_torch(cls, torch_dtype: torch.dtype) -> np.dtype:
+        """Get numpy dtype from torch dtype (for deserialization)."""
+        _, numpy_dtype = cls.get_serialization_info(torch_dtype)
+        return numpy_dtype
+    
+    @classmethod
+    def requires_conversion(cls, dtype: torch.dtype) -> bool:
+        """Check if dtype requires conversion for serialization."""
+        return dtype in cls.CONVERSION_REQUIRED
+    
+    @classmethod
+    def apply_serialization_conversion(cls, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.dtype]:
+        """Apply necessary conversions for serialization.
+        
+        Args:
+            tensor: Input tensor
+            
+        Returns:
+            Tuple of (converted_tensor, serialized_dtype)
+        """
+        original_dtype = tensor.dtype
+        serialized_dtype, _ = cls.get_serialization_info(original_dtype)
+        
+        if serialized_dtype != original_dtype:
+            # Conversion required
+            if original_dtype in [torch.complex64, torch.complex128]:
+                # Special handling for complex numbers - could take real part or flatten
+                logger.debug(f"Converting complex dtype {original_dtype} to {serialized_dtype}")
+                converted_tensor = tensor.real.to(serialized_dtype)
+            else:
+                # Standard conversion
+                converted_tensor = tensor.to(serialized_dtype)
+            return converted_tensor, serialized_dtype
+        else:
+            # No conversion needed
+            return tensor, original_dtype
+
+
 @dataclass
 class LeaseInfo:
     """Information about a lease obtained from Membrain daemon."""
     lease_id: str
     offsets: List[Tuple[int, int]]  # (offset, length) pairs
     total_size: int
-
-
-@dataclass
-class MembrainCacheMetadata:
-    """Metadata for cached items in Membrain."""
-    key: CacheEngineKey
-    bucket: str
-    size: int
-    shape: torch.Size
-    dtype: torch.dtype
-    fmt: MemoryFormat = MemoryFormat.UNDEFINED
-    lease_info: Optional[LeaseInfo] = None
 
 
 class MembrainBackend(StorageBackendInterface):
@@ -88,7 +163,6 @@ class MembrainBackend(StorageBackendInterface):
         self.config = config
         self.loop = loop
         self.memory_allocator = memory_allocator
-        self.dst_device = dst_device
 
         # Membrain configuration
         self.membrain_url = getattr(config, 'membrain_url', 'http://localhost:9200')
@@ -96,26 +170,34 @@ class MembrainBackend(StorageBackendInterface):
         self.bucket_name = getattr(config, 'membrain_bucket', 'lmcache')
         self.timeout_ms = getattr(config, 'membrain_timeout_ms', 5000)
 
-        # Cache management
-        self.cache_lock = threading.Lock()
-        self.cache_metadata: OrderedDict[CacheEngineKey, MembrainCacheMetadata] = OrderedDict()
+        # Performance optimizations for scale
+        self.max_connections = getattr(config, 'membrain_max_connections', 100)
+        self.max_connections_per_host = getattr(config, 'membrain_max_connections_per_host', 50)
+        self.serialization_threads = getattr(config, 'membrain_serialization_threads', 4)
+
+        # HTTP connection pool for high-scale performance
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.session_lock = asyncio.Lock()
         
-        # Put task tracking
+        # Thread pool for CPU-bound serialization operations
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=self.serialization_threads,
+            thread_name_prefix="membrain-serialize"
+        )
+
+        # Put task tracking - required by interface
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
         
-        # Lease management
-        self.lease_lock = threading.Lock()
-        self.active_leases: Dict[str, LeaseInfo] = {}
-        
-        # Shared memory mapping (will be initialized when needed)
+        # Shared memory mapping (lazy initialization)
         self.shared_memory_obj: Optional[shared_memory.SharedMemory] = None
         self.shared_memory_map: Optional[memoryview] = None
         self.shared_memory_lock = threading.Lock()
 
         logger.info(
             f"MembrainBackend initialized with URL: {self.membrain_url}, "
-            f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}"
+            f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}, "
+            f"max_connections: {self.max_connections}, serialization_threads: {self.serialization_threads}"
         )
 
     def __str__(self):
@@ -123,41 +205,16 @@ class MembrainBackend(StorageBackendInterface):
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Check if key exists in Membrain cache."""
-        logger.info(f"MembrainBackend: Checking contains() for key {key}")
-        
-        # First check local cache metadata
-        with self.cache_lock:
-            if key in self.cache_metadata:
-                logger.info(f"MembrainBackend: Key {key} found in local metadata cache")
-                return True
-        
-        # Check with Membrain daemon via HTTP
-        logger.info(f"MembrainBackend: Key {key} not in local cache, checking Membrain daemon")
-        result = asyncio.run_coroutine_threadsafe(
-            self._async_contains(key, pin), self.loop
-        ).result()
-        logger.info(f"MembrainBackend: Membrain daemon contains() result for key {key}: {result}")
-        return result
-
-    async def _async_contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        """Async check if key exists in Membrain."""
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}/locations"
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as response:
-                    logger.info(f"MembrainBackend: CONTAINS HTTP {response.status} for key {key}")
-                    if response.status == 200:
-                        locations_data = await response.json()
-                        # Cache the metadata for future use
-                        await self._cache_key_metadata(key, locations_data)
-                        return True
-                    elif response.status == 404:
-                        return False
-                    else:
-                        logger.warning(f"Unexpected response {response.status} for key {key}")
-                        return False
+            # Simplified sync check - no local caching complexity
+            result = asyncio.run_coroutine_threadsafe(
+                self._http_request('GET', url, timeout=2.0), self.loop
+            ).result()
+            
+            return result is not None and result.get('status') == 200
         except Exception as e:
             logger.debug(f"Failed to check key existence: {e}")
             return False
@@ -192,264 +249,238 @@ class MembrainBackend(StorageBackendInterface):
         )
         return future
 
+    async def _ensure_http_session(self) -> aiohttp.ClientSession:
+        """Ensure HTTP session with connection pooling is initialized."""
+        if self.http_session is None:
+            async with self.session_lock:
+                if self.http_session is None:  # Double-check locking
+                    connector = aiohttp.TCPConnector(
+                        limit=self.max_connections,                    # Total connection pool size
+                        limit_per_host=self.max_connections_per_host, # Per-host connection limit
+                        ttl_dns_cache=300,                           # DNS cache TTL (5 min)
+                        use_dns_cache=True,                          # Enable DNS caching
+                        keepalive_timeout=30,                        # Keep connections alive
+                        enable_cleanup_closed=True,                  # Clean up closed connections
+                    )
+                    
+                    timeout = aiohttp.ClientTimeout(
+                        total=30,        # Total timeout for request
+                        connect=5,       # Connection timeout
+                        sock_read=10,    # Socket read timeout
+                    )
+                    
+                    self.http_session = aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=timeout,
+                        headers={'User-Agent': 'LMCache-MembrainBackend/1.0'}
+                    )
+                    logger.info(f"Created HTTP session with {self.max_connections} max connections")
+        
+        return self.http_session
+
+    async def _http_request(self, method: str, url: str, data=None, params=None, timeout=5.0):
+        """Optimized HTTP request with connection pooling."""
+        try:
+            session = await self._ensure_http_session()
+            request_timeout = aiohttp.ClientTimeout(total=timeout)
+            
+            async with session.request(
+                method, url, data=data, params=params, timeout=request_timeout
+            ) as response:
+                result = {
+                    'status': response.status,
+                    'data': await response.read() if method in ['PUT', 'POST'] else None,
+                    'json': await response.json() if response.content_type == 'application/json' else None
+                }
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"HTTP {method} request timeout for {url}")
+            return None
+        except aiohttp.ClientError as e:
+            logger.error(f"HTTP {method} client error for {url}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"HTTP {method} request failed for {url}: {e}")
+            return None
+
     async def _async_put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Async PUT operation to Membrain daemon."""
+        """Optimized async PUT operation with thread pool for serialization and early memory release."""
+        serialization_start = None
+        http_start = None
+        
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}"
-            logger.info(f"MembrainBackend: Starting PUT operation for key {key} to URL {url}")
             
-            # Convert memory object to bytes
-            data = self._memory_obj_to_bytes(memory_obj)
-            logger.info(f"MembrainBackend: Serialized {len(data)} bytes for key {key}")
+            # OPTIMIZATION 1: Serialize tensor on thread pool (CPU-bound operation)
+            serialization_start = asyncio.get_event_loop().time()
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(
+                self.thread_pool, 
+                self._memory_obj_to_bytes, 
+                memory_obj
+            )
+            serialization_time = asyncio.get_event_loop().time() - serialization_start
             
-            async with aiohttp.ClientSession() as session:
-                async with session.put(
-                    url, 
-                    data=data,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout_ms/1000.0)
-                ) as response:
-                    logger.info(f"MembrainBackend: PUT HTTP response for key {key}: status={response.status}")
-                    if response.status == 200:
-                        # Store metadata locally
-                        metadata = MembrainCacheMetadata(
-                            key=key,
-                            bucket=self.bucket_name,
-                            size=memory_obj.get_size(),
-                            shape=memory_obj.get_shape(),
-                            dtype=memory_obj.get_dtype() or torch.float16,
-                            fmt=memory_obj.get_memory_format()
-                        )
-                        with self.cache_lock:
-                            self.cache_metadata[key] = metadata
-                        logger.info(f"MembrainBackend: Successfully stored key {key}")
-                    else:
-                        logger.error(f"MembrainBackend: Failed to store key {key}: HTTP {response.status}")
+            # OPTIMIZATION 2: Early memory release - tensor copied to bytes, release GPU memory
+            memory_obj.ref_count_down()
+            
+            # HTTP request on event loop (I/O-bound operation)
+            http_start = asyncio.get_event_loop().time()
+            result = await self._http_request('PUT', url, data=data, timeout=self.timeout_ms/1000.0)
+            http_time = asyncio.get_event_loop().time() - http_start
+            
+            if result and result['status'] == 200:
+                logger.debug(
+                    f"Successfully stored key {key}: {len(data)} bytes, "
+                    f"serialize: {serialization_time*1000:.1f}ms, http: {http_time*1000:.1f}ms"
+                )
+            else:
+                status = result['status'] if result else 'TIMEOUT'
+                logger.error(f"Failed to store key {key}: HTTP {status}")
                         
         except Exception as e:
-            logger.error(f"MembrainBackend: CRITICAL - Exception during PUT for key {key}: {type(e).__name__}: {e}")
+            logger.error(f"Exception during PUT for key {key}: {e}")
+            # Ensure memory is released even on error
+            try:
+                memory_obj.ref_count_down()
+            except:
+                pass  # May have already been released
         finally:
-            memory_obj.ref_count_down()
+            # Always cleanup task tracking
             with self.put_lock:
                 self.put_tasks.discard(key)
 
     def submit_prefetch_task(self, key: CacheEngineKey) -> Optional[Future]:
-        """Submit prefetch task (acquire lease without immediate data transfer)."""
-        return asyncio.run_coroutine_threadsafe(
-            self._async_prefetch(key), self.loop
-        )
-
-    async def _async_prefetch(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        """Async prefetch - acquire lease for the key."""
-        logger.info(f"MembrainBackend: Starting ASYNC PREFETCH operation for key {key}")
-        lease_info = await self._acquire_lease(key)
-        if lease_info is None:
-            logger.warning(f"MembrainBackend: ASYNC PREFETCH failed to acquire lease for key {key}")
-            return None
-        
-        # For prefetch, we don't immediately load data, just acquire the lease
-        with self.cache_lock:
-            if key in self.cache_metadata:
-                self.cache_metadata[key].lease_info = lease_info
-        
-        logger.info(f"MembrainBackend: ASYNC PREFETCH creating memory object for key {key}")
-        result = await self._create_memory_obj_from_lease(key, lease_info)
-        
-        # Always release the lease after use (success or failure)
-        release_success = await self._release_lease(lease_info.lease_id)
-        if release_success:
-            logger.info(f"MembrainBackend: Released lease {lease_info.lease_id} for key {key}")
-        else:
-            logger.warning(f"MembrainBackend: Failed to release lease {lease_info.lease_id} for key {key}")
-        
-        if result is not None:
-            logger.info(f"MembrainBackend: ASYNC PREFETCH completed successfully for key {key}")
-        else:
-            logger.error(f"MembrainBackend: ASYNC PREFETCH failed to create memory object for key {key}")
-        return result
+        """Submit prefetch task - unified with other GET operations."""
+        return asyncio.run_coroutine_threadsafe(self._get_memory_obj(key), self.loop)
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Blocking GET operation from Membrain."""
-        logger.info(f"MembrainBackend: Starting GET operation for key {key}")
         try:
-            result = asyncio.run_coroutine_threadsafe(
-                self._async_get_blocking(key), self.loop
-            ).result()
-            if result is not None:
-                logger.info(f"MembrainBackend: GET operation successful for key {key}")
-            else:
-                logger.warning(f"MembrainBackend: GET operation failed for key {key}")
-            return result
+            return asyncio.run_coroutine_threadsafe(self._get_memory_obj(key), self.loop).result()
         except Exception as e:
-            logger.error(f"MembrainBackend: GET operation exception for key {key}: {e}")
-            return None
-
-    async def _async_get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        """Async blocking GET operation."""
-        logger.info(f"MembrainBackend: Acquiring lease for key {key}")
-        # First acquire lease
-        lease_info = await self._acquire_lease(key)
-        if lease_info is None:
-            logger.warning(f"MembrainBackend: Failed to acquire lease for key {key}")
-            return None
-        
-        logger.info(f"MembrainBackend: Lease acquired {lease_info.lease_id}, creating memory object")
-        try:
-            result = await self._create_memory_obj_from_lease(key, lease_info)
-            if result is not None:
-                logger.info(f"MembrainBackend: Memory object created successfully for key {key}")
-            return result
-        except Exception as e:
-            logger.error(f"MembrainBackend: Failed to create memory object for key {key}: {e}")
-            # Release lease on failure
-            await self._release_lease(lease_info.lease_id)
+            logger.error(f"GET operation exception for key {key}: {e}")
             return None
 
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
         """Non-blocking GET operation."""
-        logger.info(f"MembrainBackend: Starting NON-BLOCKING GET operation for key {key}")
-        future = self.submit_prefetch_task(key)
-        if future is not None:
-            logger.info(f"MembrainBackend: NON-BLOCKING GET future created for key {key}")
-        else:
-            logger.error(f"MembrainBackend: NON-BLOCKING GET failed to create future for key {key}")
-        return future
+        return asyncio.run_coroutine_threadsafe(self._get_memory_obj(key), self.loop)
+
+    async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Unified GET method: lease → read → reconstruct → release."""
+        # Step 1: Acquire lease
+        lease_info = await self._acquire_lease(key)
+        if lease_info is None:
+            return None
+        
+        try:
+            # Step 2: Read and reconstruct tensor from shared memory
+            result = await self._read_tensor_from_lease(key, lease_info)
+            return result
+        finally:
+            # Step 3: Always release lease
+            await self._release_lease(lease_info.lease_id)
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Acquire a lease for the given key from Membrain daemon."""
-        try:
-            key_str = self._key_to_string(key)
-            url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}/leases"
-            
-            params = {"timeout_ms": self.timeout_ms}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, 
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout_ms/1000.0)
-                ) as response:
-                    logger.info(f"MembrainBackend: LEASE HTTP {response.status} for key {key}")
-                    if response.status == 200:
-                        lease_data = await response.json()
-                        lease_info = LeaseInfo(
-                            lease_id=lease_data["id"],
-                            offsets=[(o["offset"], o["len"]) for o in lease_data["offsets"]],
-                            total_size=sum(o["len"] for o in lease_data["offsets"])
-                        )
-                        
-                        with self.lease_lock:
-                            self.active_leases[lease_info.lease_id] = lease_info
-                        
-                        logger.info(f"MembrainBackend: Acquired lease {lease_info.lease_id} for key {key}, total_size={lease_info.total_size}, offsets={len(lease_info.offsets)}")
-                        return lease_info
-                    elif response.status == 404:
-                        logger.debug(f"Key {key} not found for lease acquisition")
-                        return None
-                    else:
-                        logger.error(f"Failed to acquire lease for key {key}: {response.status}")
-                        return None
-                        
-        except Exception as e:
-            logger.error(f"MembrainBackend: CRITICAL - Exception during lease acquisition for key {key}: {type(e).__name__}: {e}")
-            return None
+        key_str = self._key_to_string(key)
+        url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}/leases"
+        params = {"timeout_ms": self.timeout_ms}
+        
+        result = await self._http_request('POST', url, params=params, timeout=self.timeout_ms/1000.0)
+        
+        if result and result['status'] == 200 and result['json']:
+            lease_data = result['json']
+            return LeaseInfo(
+                lease_id=lease_data["id"],
+                offsets=[(o["offset"], o["len"]) for o in lease_data["offsets"]],
+                total_size=sum(o["len"] for o in lease_data["offsets"])
+            )
+        return None
 
     async def _release_lease(self, lease_id: str) -> bool:
         """Release a lease."""
-        try:
-            url = f"{self.membrain_url}/v1/leases/{lease_id}/release"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=2.0)
-                ) as response:
-                    logger.info(f"MembrainBackend: RELEASE HTTP {response.status} for lease {lease_id}")
-                    success = response.status == 200
-                    if success:
-                        with self.lease_lock:
-                            self.active_leases.pop(lease_id, None)
-                        logger.debug(f"Released lease {lease_id}")
-                    else:
-                        logger.error(f"Failed to release lease {lease_id}: {response.status}")
-                    return success
-                    
-        except Exception as e:
-            logger.error(f"Error releasing lease {lease_id}: {e}")
-            return False
+        url = f"{self.membrain_url}/v1/leases/{lease_id}/release"
+        result = await self._http_request('POST', url, timeout=2.0)
+        return result and result['status'] == 200
 
-    async def _create_memory_obj_from_lease(self, key: CacheEngineKey, lease_info: LeaseInfo) -> Optional[MemoryObj]:
-        """Create a MemoryObj by reading data from shared memory using lease offsets.
-        
-        Reconstructs tensor from serialized format: [4 bytes metadata size][metadata json][tensor bytes]
-        This ensures PUT/GET consistency by properly deserializing the stored data.
-        """
-        # Initialize shared memory if needed
+    async def _read_tensor_from_lease(self, key: CacheEngineKey, lease_info: LeaseInfo) -> Optional[MemoryObj]:
+        """Unified tensor reading from lease - handles both single and multi-block cases."""
         if not await self._ensure_shared_memory():
-            logger.error("Failed to initialize shared memory")
+            return None
+        
+        if not lease_info.offsets:
+            logger.error(f"No offsets in lease for key {key}")
             return None
         
         try:
-            # Read all data from shared memory offsets
+            # Read all data (single block is just multi-block with length=1)
             total_data = bytearray()
             for offset, length in lease_info.offsets:
-                if self.shared_memory_map is not None:
-                    chunk = bytes(self.shared_memory_map[offset:offset + length])
-                    total_data.extend(chunk)
-                    logger.debug(f"Read {length} bytes from offset {offset}")
+                chunk = bytes(self.shared_memory_map[offset:offset + length])
+                total_data.extend(chunk)
             
-            # Parse metadata header (first 4 bytes contain metadata size)
+            # Validate total size
+            if len(total_data) != lease_info.total_size:
+                logger.error(f"Size mismatch: expected {lease_info.total_size}, got {len(total_data)}")
+                return None
+            
+            # Parse format: [4 bytes metadata size][metadata json][tensor bytes]  
             if len(total_data) < 4:
-                logger.error(f"Insufficient data to read metadata header for key {key}")
+                logger.error(f"Insufficient data for metadata header")
                 return None
             
-            # Extract metadata size
             metadata_size = int.from_bytes(total_data[:4], 'little')
-            
             if len(total_data) < 4 + metadata_size:
-                logger.error(f"Insufficient data to read metadata for key {key}")
+                logger.error(f"Insufficient data for metadata")
                 return None
             
-            # Extract and parse metadata JSON
+            # Extract metadata and tensor data
             metadata_json = total_data[4:4 + metadata_size].decode('utf-8')
             tensor_metadata = json.loads(metadata_json)
-            
-            # Extract tensor data
             tensor_bytes = bytes(total_data[4 + metadata_size:])
-            expected_size = tensor_metadata['tensor_size']
             
-            if len(tensor_bytes) != expected_size:
-                logger.error(f"Tensor size mismatch for key {key}: expected {expected_size}, got {len(tensor_bytes)}")
+            if len(tensor_bytes) != tensor_metadata['tensor_size']:
+                logger.error(f"Tensor size mismatch")
                 return None
             
-            # Reconstruct tensor from metadata
+            # Reconstruct tensor using centralized dtype handling
+            return await self._create_tensor_from_metadata_and_data(key, tensor_metadata, tensor_bytes)
+            
+        except Exception as e:
+            logger.error(f"Error reading tensor from lease for key {key}: {e}")
+            return None
+
+    async def _create_tensor_from_metadata_and_data(self, key: CacheEngineKey, tensor_metadata: dict, tensor_data) -> Optional[MemoryObj]:
+        """Create tensor from metadata and data with minimal copying and centralized dtype handling."""
+        try:
+            # Parse tensor metadata
             shape = torch.Size(tensor_metadata['shape'])
             original_dtype_str = tensor_metadata['original_dtype']
             serialized_dtype_str = tensor_metadata['serialized_dtype']
             memory_format = MemoryFormat(tensor_metadata['format'])
             
-            # Parse dtype strings
+            # Parse dtype strings safely
             original_dtype = getattr(torch, original_dtype_str.replace('torch.', ''))
             serialized_dtype = getattr(torch, serialized_dtype_str.replace('torch.', ''))
             
-            # Convert bytes to numpy array with serialized dtype
-            if serialized_dtype == torch.float32:
-                numpy_dtype = np.float32
-            elif serialized_dtype == torch.float16:
-                numpy_dtype = np.float16
-            elif serialized_dtype == torch.bfloat16:
-                numpy_dtype = np.float32  # bfloat16 is stored as float32
+            # Use centralized dtype manager for numpy conversion
+            numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
+            
+            # Zero-copy numpy array creation
+            if isinstance(tensor_data, memoryview):
+                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
             else:
-                # Handle other dtypes as needed
-                numpy_dtype = np.float32
-                logger.warning(f"Unknown serialized dtype {serialized_dtype}, using float32")
+                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
             
-            numpy_array = np.frombuffer(tensor_bytes, dtype=numpy_dtype)
-            reconstructed_tensor = torch.from_numpy(numpy_array.copy()).reshape(shape)
+            # Create tensor without unnecessary copy
+            reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
             
-            # Convert back to original dtype if needed
+            # Convert back to original dtype if serialization required conversion
             if original_dtype != serialized_dtype:
                 reconstructed_tensor = reconstructed_tensor.to(original_dtype)
+                logger.debug(f"Converted tensor back from {serialized_dtype} to {original_dtype}")
             
             # Allocate memory object with correct format
             memory_obj = self.memory_allocator.allocate(shape, original_dtype, memory_format)
@@ -457,13 +488,17 @@ class MembrainBackend(StorageBackendInterface):
                 logger.error(f"Failed to allocate memory for key {key}")
                 return None
             
-            # Copy reconstructed tensor to allocated memory
+            # Efficient device transfer
             if memory_obj.tensor is not None:
-                # Move tensor to target device and copy
-                target_tensor = reconstructed_tensor.to(memory_obj.tensor.device)
-                memory_obj.tensor.copy_(target_tensor)
+                if reconstructed_tensor.device != memory_obj.tensor.device:
+                    # Only transfer device if necessary
+                    target_tensor = reconstructed_tensor.to(memory_obj.tensor.device, non_blocking=True)
+                    memory_obj.tensor.copy_(target_tensor, non_blocking=True)
+                else:
+                    # Same device - direct copy
+                    memory_obj.tensor.copy_(reconstructed_tensor)
                 
-                logger.info(f"MembrainBackend: Successfully reconstructed tensor for key {key}: shape={shape}, dtype={original_dtype}, format={memory_format}")
+                logger.debug(f"Reconstructed tensor: shape={shape}, {serialized_dtype}->{original_dtype}, format={memory_format}")
                 return memory_obj
             else:
                 logger.error(f"Allocated memory object has no tensor for key {key}")
@@ -471,7 +506,7 @@ class MembrainBackend(StorageBackendInterface):
                 return None
                 
         except Exception as e:
-            logger.error(f"Error reading data from shared memory for key {key}: {e}")
+            logger.error(f"Error creating tensor from metadata for key {key}: {e}")
             return None
 
     async def _ensure_shared_memory(self) -> bool:
@@ -503,28 +538,35 @@ class MembrainBackend(StorageBackendInterface):
 
     def pin(self, key: CacheEngineKey) -> bool:
         """Pin operation - not implemented for Membrain."""
-        logger.warning("Pin operation not supported by MembrainBackend")
         return True
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        """Unpin operation - not implemented for Membrain."""
-        logger.warning("Unpin operation not supported by MembrainBackend")
+        """Unpin operation - not implemented for Membrain."""  
         return True
 
     def close(self) -> None:
         """Close the backend and release resources."""
-        # Release all active leases
-        if self.active_leases:
-            logger.info(f"Releasing {len(self.active_leases)} active leases")
-            for lease_id in list(self.active_leases.keys()):
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._release_lease(lease_id), self.loop
-                    ).result(timeout=5.0)
-                except Exception as e:
-                    logger.error(f"Error releasing lease {lease_id}: {e}")
+        # Close HTTP session and connection pool
+        if self.http_session is not None:
+            try:
+                # Schedule closure on the event loop
+                asyncio.run_coroutine_threadsafe(
+                    self.http_session.close(), self.loop
+                ).result(timeout=5.0)
+                logger.info("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
+            self.http_session = None
         
-        # Close shared memory safely
+        # Shutdown thread pool
+        if self.thread_pool is not None:
+            try:
+                self.thread_pool.shutdown(wait=True, timeout=10.0)
+                logger.info("Thread pool shutdown complete")
+            except Exception as e:
+                logger.error(f"Error shutting down thread pool: {e}")
+        
+        # Close shared memory resources
         with self.shared_memory_lock:
             if self.shared_memory_map is not None:
                 try:
@@ -533,14 +575,14 @@ class MembrainBackend(StorageBackendInterface):
                     logger.error(f"Error releasing shared memory map: {e}")
                 self.shared_memory_map = None
                 
-            if self.shared_memory_obj is not None:
+            if self.shared_memory_obj is not None:  
                 try:
                     self.shared_memory_obj.close()
                 except Exception as e:
                     logger.error(f"Error closing shared memory: {e}")
                 self.shared_memory_obj = None
         
-        logger.info("MembrainBackend closed.")
+        logger.info("MembrainBackend closed with all resources cleaned up.")
 
     # Helper methods
 
@@ -555,31 +597,12 @@ class MembrainBackend(StorageBackendInterface):
         # URL encode the entire key to handle all special characters safely
         return urllib.parse.quote(key_str, safe="")
 
-    async def _cache_key_metadata(self, key: CacheEngineKey, locations_data: dict) -> None:
-        """Cache metadata from locations response."""
-        if "locations" in locations_data and locations_data["locations"]:
-            location = locations_data["locations"][0]
-            # Extract size and other metadata if available
-            size = location.get("length", 0)
-            
-            # Create basic metadata - in real implementation you'd need more info
-            metadata = MembrainCacheMetadata(
-                key=key,
-                bucket=self.bucket_name,
-                size=size,
-                shape=torch.Size([size]),  # Placeholder
-                dtype=torch.uint8,  # Placeholder
-                fmt=MemoryFormat.UNDEFINED  # Will be updated during PUT
-            )
-            
-            with self.cache_lock:
-                self.cache_metadata[key] = metadata
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
         """Convert MemoryObj to bytes for HTTP transmission with metadata header.
         
         Format: [4 bytes metadata size][metadata json][tensor bytes]
-        This ensures PUT/GET consistency by preserving all tensor metadata.
+        Uses centralized DTypeManager for consistent dtype handling.
         """
         tensor = memory_obj.tensor
         if tensor is None:
@@ -594,26 +617,21 @@ class MembrainBackend(StorageBackendInterface):
         if tensor.is_cuda:
             tensor = tensor.cpu()
         
-        # Handle BFloat16 which can't convert to numpy directly
-        # Following GDS pattern for dtype handling
-        serialized_dtype = original_dtype
-        if tensor.dtype == torch.bfloat16:
-            # Convert BFloat16 to Float32 for numpy compatibility
-            tensor = tensor.to(torch.float32)
-            serialized_dtype = torch.float32
-        elif tensor.dtype == torch.float8_e4m3fn or tensor.dtype == torch.float8_e5m2:
-            # Handle other unsupported dtypes
-            tensor = tensor.to(torch.float32)
-            serialized_dtype = torch.float32
-        
+        # Apply dtype conversion using centralized manager
         try:
-            tensor_bytes = tensor.numpy().tobytes()
+            converted_tensor, serialized_dtype = DTypeManager.apply_serialization_conversion(tensor)
+            tensor_bytes = converted_tensor.numpy().tobytes()
         except Exception as e:
             logger.error(f"Failed to convert tensor to bytes, dtype={tensor.dtype}: {e}")
-            # Fallback: convert to float32 and try again
-            tensor = tensor.to(torch.float32)
-            serialized_dtype = torch.float32
-            tensor_bytes = tensor.numpy().tobytes()
+            # Emergency fallback - should rarely happen with proper DTypeManager
+            try:
+                fallback_tensor = tensor.to(torch.float32)
+                tensor_bytes = fallback_tensor.numpy().tobytes()
+                serialized_dtype = torch.float32
+                logger.warning(f"Used emergency fallback conversion for dtype {original_dtype}")
+            except Exception as fallback_error:
+                logger.error(f"Emergency fallback also failed: {fallback_error}")
+                return b""
         
         # Create metadata header for proper reconstruction
         metadata_dict = {
@@ -631,5 +649,5 @@ class MembrainBackend(StorageBackendInterface):
         # Format: [4 bytes metadata size][metadata json][tensor bytes]
         result = metadata_size.to_bytes(4, 'little') + metadata_json + tensor_bytes
         
-        logger.info(f"MembrainBackend: Serialized tensor: shape={original_shape}, dtype={original_dtype}, format={original_format}, size={len(result)} bytes")
+        logger.debug(f"Serialized tensor: shape={original_shape}, {original_dtype}->{serialized_dtype}, size={len(result)} bytes")
         return result
