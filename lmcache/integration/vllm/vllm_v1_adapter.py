@@ -33,7 +33,9 @@ import zmq
 
 # First Party
 from lmcache.config import LMCacheEngineConfig as Config  # type: ignore[assignment]
-from lmcache.integration.vllm.lmcache_direct_lookup_client import LMCacheDirectLookupClient
+from lmcache.integration.vllm.lmcache_direct_lookup_client import (
+    LMCacheDirectLookupClient,
+)
 from lmcache.integration.vllm.utils import ENGINE_NAME, lmcache_get_config
 from lmcache.integration.vllm.vllm_adapter import get_or_init_lmcache_engine
 from lmcache.logging import init_logger
@@ -388,7 +390,9 @@ class LMCacheConnectorV1Impl:
 
         if role == KVConnectorRole.SCHEDULER:
             if self.is_direct_remote_access:
-                logger.info("Using LMCacheDirectLookupClient, skipping RPC to lookup server")
+                logger.info(
+                    "Using LMCacheDirectLookupClient, skipping RPC to lookup server"
+                )
                 self.lookup_client = LMCacheDirectLookupClient(self.lmcache_engine)
             else:
                 self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
@@ -406,7 +410,10 @@ class LMCacheConnectorV1Impl:
             # NOTE: Only create the KV lookup API server on worker rank 0
             # when there are multiple workers
             assert self.lmcache_engine is not None
-            if vllm_config.parallel_config.rank == 0 and not self.is_direct_remote_access:
+            if (
+                vllm_config.parallel_config.rank == 0
+                and not self.is_direct_remote_access
+            ):
                 self.lookup_server = LMCacheLookupServer(
                     self.lmcache_engine, role, is_tp, vllm_config
                 )
@@ -455,13 +462,15 @@ class LMCacheConnectorV1Impl:
 
     def _is_direct_remote_access(self, config: Union[Config, V1Config]) -> bool:
         # Handle various representations of zero: 0, 0.0, or very small values
-        is_zero_cpu = (isinstance(config.max_local_cpu_size, (int, float)) and
-                       abs(config.max_local_cpu_size) < 0.001)
-        has_remote = ((config.remote_url is not None and config.remote_url.strip() != "") or
-                      (config.membrain_url is not None and config.membrain_url.strip() != ""))
+        is_zero_cpu = (
+            isinstance(config.max_local_cpu_size, (int, float))
+            and abs(config.max_local_cpu_size) < 0.001
+        )
+        has_remote = (
+            config.remote_url is not None and config.remote_url.strip() != ""
+        ) or (config.membrain_url is not None and config.membrain_url.strip() != "")
 
         return is_zero_cpu and has_remote
-
 
     ####################
     # Worker side APIs
@@ -526,6 +535,24 @@ class LMCacheConnectorV1Impl:
                 token_mask = token_mask[: -self.skip_last_n_tokens]
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+
+            # CRITICAL FIX: Create chunk-aligned retrieval mask to preserve optimization
+            # while ensuring consistent key generation with scheduler
+            chunk_size = self._lmcache_chunk_size
+
+            # Calculate how many complete chunks we can process with cached tokens
+            cached_chunks = lmcache_cached_tokens // chunk_size
+            chunk_aligned_tokens = cached_chunks * chunk_size
+
+            # Create mask: True for cached tokens, False for non-cached complete chunks
+            retrieval_mask = token_mask.clone()
+            if chunk_aligned_tokens < len(tokens):
+                # Calculate how many tokens to mask out (must be multiple of chunk_size)
+                remaining_tokens = len(tokens) - chunk_aligned_tokens
+                tokens_to_mask = (remaining_tokens // chunk_size) * chunk_size
+                if tokens_to_mask > 0:
+                    retrieval_mask[-tokens_to_mask:] = False
+
             if self.use_layerwise:
                 assert isinstance(self.lmcache_engine, LayerwiseLMCacheEngine)
                 if idx == last_idx:
@@ -535,18 +562,18 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     self.blender.blend(
-                        tokens[: request.load_spec.lmcache_cached_tokens],
-                        token_mask[: request.load_spec.lmcache_cached_tokens],
+                        tokens,  # Full tokens for consistent key generation
+                        retrieval_mask,  # Chunk-aligned mask for optimization
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping,
                     )
                 else:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        tokens,  # Full tokens for consistent key generation
+                        retrieval_mask,  # Chunk-aligned mask for optimization
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=slot_mapping,
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
@@ -555,18 +582,17 @@ class LMCacheConnectorV1Impl:
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
+                    tokens,  # Full tokens for consistent key generation
+                    retrieval_mask,  # Chunk-aligned mask for optimization
                     kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    slot_mapping=slot_mapping,
                 )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
+                # Calculate expected tokens based on chunk-aligned retrieval mask
                 num_expected_tokens = (
-                    request.load_spec.lmcache_cached_tokens
-                    - request.load_spec.vllm_cached_tokens
-                    - self.skip_last_n_tokens
+                    retrieval_mask.sum().item() - request.load_spec.vllm_cached_tokens
                 )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(

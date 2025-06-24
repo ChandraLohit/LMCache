@@ -825,7 +825,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # Use max_tokens from kwargs if provided, otherwise use default
             max_tokens = kwargs.get("max_tokens", 32000)
-            logger.info(f"Using max_tokens={max_tokens} for GPU buffer allocation in PagedMemLayerwiseGPUConnector")
+            logger.info(
+                f"Using max_tokens={max_tokens} for GPU buffer allocation in "
+                f"PagedMemLayerwiseGPUConnector"
+            )
             shape = self.get_shape(max_tokens)
             self.dtype = kwargs["dtype"]
             self.device = kwargs["device"]

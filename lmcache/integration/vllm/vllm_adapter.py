@@ -108,10 +108,11 @@ def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
 
 
 def get_or_init_lmcache_engine(
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        cache_config: CacheConfig,
-        scheduler_config: SchedulerConfig,) -> LMCacheEngine:
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+    cache_config: CacheConfig,
+    scheduler_config: SchedulerConfig,
+) -> LMCacheEngine:
     if LMCacheEngineBuilder.get(ENGINE_NAME) is not None:
         # Return existing cache engine when tensor parallel is not used
         return LMCacheEngineBuilder.get(ENGINE_NAME)
@@ -211,7 +212,9 @@ def init_lmcache_engine(
 
     # Pass max_tokens from scheduler_config to connectors
     max_tokens = scheduler_config.max_num_batched_tokens if scheduler_config else 32000
-    logger.info(f"Using max_tokens={max_tokens} from scheduler config for GPU buffer allocation")
+    logger.info(
+        f"Using max_tokens={max_tokens} from scheduler config for GPU buffer allocation"
+    )
 
     if use_mla:
         if config.use_layerwise:

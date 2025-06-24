@@ -644,8 +644,9 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
         yield None
 
-        # synchronize the last layer
-        next(mem_obj_consumer)
+        # synchronize the last layer (only if we have cache keys)
+        if keys:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -716,7 +717,9 @@ class LMCacheEngineBuilder:
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
         if config.membrain_url is not None:
-            assert config.membrain_buffer_size is not None, "Need to specify membrain_buffer_size for MembrainBackend"
+            assert config.membrain_buffer_size is not None, (
+                "Need to specify membrain_buffer_size for MembrainBackend"
+            )
             return MixedMemoryAllocator(config.membrain_buffer_size * 1024**2)
 
         max_local_cpu_size = config.max_local_cpu_size

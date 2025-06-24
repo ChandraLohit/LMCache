@@ -138,3 +138,4 @@ MEMBRAIN_IMPROVEMENTS.md
 benchmarks/multi-round-qa/ShareGPT_V3_unfiltered_cleaned_split.json
 benchmarks/multi-round-qa/ShareGPT.json
 benchmarks/multi-round-qa/summary.csv
+.kiro/
