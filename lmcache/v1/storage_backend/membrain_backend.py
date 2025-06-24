@@ -171,9 +171,9 @@ class MembrainBackend(StorageBackendInterface):
         self.timeout_ms = getattr(config, 'membrain_timeout_ms', 5000)
 
         # Performance optimizations for scale
-        self.max_connections = getattr(config, 'membrain_max_connections', 100)
-        self.max_connections_per_host = getattr(config, 'membrain_max_connections_per_host', 50)
-        self.serialization_threads = getattr(config, 'membrain_serialization_threads', 4)
+        self.max_connections = getattr(config, 'membrain_max_connections', 256)
+        self.max_connections_per_host = getattr(config, 'membrain_max_connections_per_host', 128)
+        self.serialization_threads = getattr(config, 'membrain_serialization_threads', 16)
 
         # HTTP connection pool for high-scale performance
         self.http_session: Optional[aiohttp.ClientSession] = None
@@ -188,7 +188,7 @@ class MembrainBackend(StorageBackendInterface):
         # Put task tracking - required by interface
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
-        
+
         # Shared memory mapping (lazy initialization)
         self.shared_memory_obj: Optional[shared_memory.SharedMemory] = None
         self.shared_memory_map: Optional[memoryview] = None
@@ -197,7 +197,8 @@ class MembrainBackend(StorageBackendInterface):
         logger.info(
             f"MembrainBackend initialized with URL: {self.membrain_url}, "
             f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}, "
-            f"max_connections: {self.max_connections}, serialization_threads: {self.serialization_threads}"
+            f"max_connections: {self.max_connections}, max_connections_per_host: {self.max_connections_per_host}, "
+            f"serialization_threads: {self.serialization_threads}"
         )
 
     def __str__(self):
@@ -208,12 +209,12 @@ class MembrainBackend(StorageBackendInterface):
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}/locations"
-            
+
             # Simplified sync check - no local caching complexity
             result = asyncio.run_coroutine_threadsafe(
                 self._http_request('GET', url, timeout=2.0), self.loop
             ).result()
-            
+
             return result is not None and result.get('status') == 200
         except Exception as e:
             logger.debug(f"Failed to check key existence: {e}")
@@ -224,30 +225,29 @@ class MembrainBackend(StorageBackendInterface):
         with self.put_lock:
             return key in self.put_tasks
 
+    @_lmcache_nvtx_annotate
     def batched_submit_put_task(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ) -> Optional[List[Future]]:
         """Submit batch of PUT tasks to Membrain."""
-        futures = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            future = self.submit_put_task(key, memory_obj)
-            if future is not None:
-                futures.append(future)
-        return futures if futures else None
+            self.submit_put_task(key, memory_obj)
+        return None
 
+    @_lmcache_nvtx_annotate
     def submit_put_task(
         self, key: CacheEngineKey, memory_obj: MemoryObj
     ) -> Optional[Future]:
         """Submit a single PUT task to Membrain."""
         memory_obj.ref_count_up()
-        
+
         with self.put_lock:
             self.put_tasks.add(key)
-        
-        future = asyncio.run_coroutine_threadsafe(
-            self._async_put(key, memory_obj), self.loop
+
+        self.loop.call_soon_threadsafe(
+            asyncio.create_task, self._async_put(key, memory_obj)
         )
-        return future
+        return None
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
         """Ensure HTTP session with connection pooling is initialized."""
@@ -262,20 +262,20 @@ class MembrainBackend(StorageBackendInterface):
                         keepalive_timeout=30,                        # Keep connections alive
                         enable_cleanup_closed=True,                  # Clean up closed connections
                     )
-                    
+
                     timeout = aiohttp.ClientTimeout(
                         total=30,        # Total timeout for request
                         connect=5,       # Connection timeout
                         sock_read=10,    # Socket read timeout
                     )
-                    
+
                     self.http_session = aiohttp.ClientSession(
                         connector=connector,
                         timeout=timeout,
                         headers={'User-Agent': 'LMCache-MembrainBackend/1.0'}
                     )
                     logger.info(f"Created HTTP session with {self.max_connections} max connections")
-        
+
         return self.http_session
 
     async def _http_request(self, method: str, url: str, data=None, params=None, timeout=5.0):
@@ -283,7 +283,7 @@ class MembrainBackend(StorageBackendInterface):
         try:
             session = await self._ensure_http_session()
             request_timeout = aiohttp.ClientTimeout(total=timeout)
-            
+
             async with session.request(
                 method, url, data=data, params=params, timeout=request_timeout
             ) as response:
@@ -303,33 +303,36 @@ class MembrainBackend(StorageBackendInterface):
             logger.error(f"HTTP {method} request failed for {url}: {e}")
             return None
 
+    @_lmcache_nvtx_annotate
     async def _async_put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         """Optimized async PUT operation with thread pool for serialization and early memory release."""
         serialization_start = None
         http_start = None
-        
+        memory_released = False
+
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}"
-            
+
             # OPTIMIZATION 1: Serialize tensor on thread pool (CPU-bound operation)
-            serialization_start = asyncio.get_event_loop().time()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
+            serialization_start = loop.time()
             data = await loop.run_in_executor(
-                self.thread_pool, 
-                self._memory_obj_to_bytes, 
+                self.thread_pool,
+                self._memory_obj_to_bytes,
                 memory_obj
             )
-            serialization_time = asyncio.get_event_loop().time() - serialization_start
-            
+            serialization_time = loop.time() - serialization_start
+
             # OPTIMIZATION 2: Early memory release - tensor copied to bytes, release GPU memory
             memory_obj.ref_count_down()
-            
+            memory_released = True
+
             # HTTP request on event loop (I/O-bound operation)
-            http_start = asyncio.get_event_loop().time()
+            http_start = loop.time()
             result = await self._http_request('PUT', url, data=data, timeout=self.timeout_ms/1000.0)
-            http_time = asyncio.get_event_loop().time() - http_start
-            
+            http_time = loop.time() - http_start
+
             if result and result['status'] == 200:
                 logger.debug(
                     f"Successfully stored key {key}: {len(data)} bytes, "
@@ -338,14 +341,14 @@ class MembrainBackend(StorageBackendInterface):
             else:
                 status = result['status'] if result else 'TIMEOUT'
                 logger.error(f"Failed to store key {key}: HTTP {status}")
-                        
         except Exception as e:
-            logger.error(f"Exception during PUT for key {key}: {e}")
+            logger.exception(f"Exception during PUT for key {key}: {e}")
             # Ensure memory is released even on error
-            try:
-                memory_obj.ref_count_down()
-            except:
-                pass  # May have already been released
+            if not memory_released:
+                try:
+                    memory_obj.ref_count_down()
+                except:
+                    pass  # May have already been released or failed for other reasons
         finally:
             # Always cleanup task tracking
             with self.put_lock:
@@ -373,7 +376,7 @@ class MembrainBackend(StorageBackendInterface):
         lease_info = await self._acquire_lease(key)
         if lease_info is None:
             return None
-        
+
         try:
             # Step 2: Read and reconstruct tensor from shared memory
             result = await self._read_tensor_from_lease(key, lease_info)
@@ -387,9 +390,9 @@ class MembrainBackend(StorageBackendInterface):
         key_str = self._key_to_string(key)
         url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}/leases"
         params = {"timeout_ms": self.timeout_ms}
-        
+
         result = await self._http_request('POST', url, params=params, timeout=self.timeout_ms/1000.0)
-        
+
         if result and result['status'] == 200 and result['json']:
             lease_data = result['json']
             return LeaseInfo(
@@ -409,45 +412,45 @@ class MembrainBackend(StorageBackendInterface):
         """Unified tensor reading from lease - handles both single and multi-block cases."""
         if not await self._ensure_shared_memory():
             return None
-        
+
         if not lease_info.offsets:
             logger.error(f"No offsets in lease for key {key}")
             return None
-        
+
         try:
             # Read all data (single block is just multi-block with length=1)
             total_data = bytearray()
             for offset, length in lease_info.offsets:
                 chunk = bytes(self.shared_memory_map[offset:offset + length])
                 total_data.extend(chunk)
-            
+
             # Validate total size
             if len(total_data) != lease_info.total_size:
                 logger.error(f"Size mismatch: expected {lease_info.total_size}, got {len(total_data)}")
                 return None
-            
+
             # Parse format: [4 bytes metadata size][metadata json][tensor bytes]  
             if len(total_data) < 4:
                 logger.error(f"Insufficient data for metadata header")
                 return None
-            
+
             metadata_size = int.from_bytes(total_data[:4], 'little')
             if len(total_data) < 4 + metadata_size:
                 logger.error(f"Insufficient data for metadata")
                 return None
-            
+
             # Extract metadata and tensor data
             metadata_json = total_data[4:4 + metadata_size].decode('utf-8')
             tensor_metadata = json.loads(metadata_json)
             tensor_bytes = bytes(total_data[4 + metadata_size:])
-            
+
             if len(tensor_bytes) != tensor_metadata['tensor_size']:
                 logger.error(f"Tensor size mismatch")
                 return None
-            
+
             # Reconstruct tensor using centralized dtype handling
             return await self._create_tensor_from_metadata_and_data(key, tensor_metadata, tensor_bytes)
-            
+
         except Exception as e:
             logger.error(f"Error reading tensor from lease for key {key}: {e}")
             return None
@@ -460,34 +463,34 @@ class MembrainBackend(StorageBackendInterface):
             original_dtype_str = tensor_metadata['original_dtype']
             serialized_dtype_str = tensor_metadata['serialized_dtype']
             memory_format = MemoryFormat(tensor_metadata['format'])
-            
+
             # Parse dtype strings safely
             original_dtype = getattr(torch, original_dtype_str.replace('torch.', ''))
             serialized_dtype = getattr(torch, serialized_dtype_str.replace('torch.', ''))
-            
+
             # Use centralized dtype manager for numpy conversion
             numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
-            
+
             # Zero-copy numpy array creation
             if isinstance(tensor_data, memoryview):
                 numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
             else:
                 numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
-            
+
             # Create tensor without unnecessary copy
             reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
-            
+
             # Convert back to original dtype if serialization required conversion
             if original_dtype != serialized_dtype:
                 reconstructed_tensor = reconstructed_tensor.to(original_dtype)
                 logger.debug(f"Converted tensor back from {serialized_dtype} to {original_dtype}")
-            
+
             # Allocate memory object with correct format
             memory_obj = self.memory_allocator.allocate(shape, original_dtype, memory_format)
             if memory_obj is None:
                 logger.error(f"Failed to allocate memory for key {key}")
                 return None
-            
+
             # Efficient device transfer
             if memory_obj.tensor is not None:
                 if reconstructed_tensor.device != memory_obj.tensor.device:
@@ -497,14 +500,14 @@ class MembrainBackend(StorageBackendInterface):
                 else:
                     # Same device - direct copy
                     memory_obj.tensor.copy_(reconstructed_tensor)
-                
+
                 logger.debug(f"Reconstructed tensor: shape={shape}, {serialized_dtype}->{original_dtype}, format={memory_format}")
                 return memory_obj
             else:
                 logger.error(f"Allocated memory object has no tensor for key {key}")
                 memory_obj.ref_count_down()
                 return None
-                
+
         except Exception as e:
             logger.error(f"Error creating tensor from metadata for key {key}: {e}")
             return None
@@ -514,21 +517,21 @@ class MembrainBackend(StorageBackendInterface):
         with self.shared_memory_lock:
             if self.shared_memory_map is not None:
                 return True
-            
+
             if self.shared_memory_name is None:
                 logger.error("No shared memory name configured")
                 return False
-            
+
             try:
                 # Try to open existing shared memory segment created by Membrain daemon
                 self.shared_memory_obj = shared_memory.SharedMemory(
                     name=self.shared_memory_name, create=False
                 )
                 self.shared_memory_map = memoryview(self.shared_memory_obj.buf)
-                
+
                 logger.info(f"MembrainBackend: Successfully opened shared memory: {self.shared_memory_name} (size: {len(self.shared_memory_map)} bytes)")
                 return True
-                
+
             except FileNotFoundError:
                 logger.error(f"MembrainBackend: CRITICAL - Shared memory segment '{self.shared_memory_name}' not found. Is Membrain daemon running and creating shared memory?")
                 return False
@@ -541,7 +544,7 @@ class MembrainBackend(StorageBackendInterface):
         return True
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        """Unpin operation - not implemented for Membrain."""  
+        """Unpin operation - not implemented for Membrain."""
         return True
 
     def close(self) -> None:
@@ -557,7 +560,7 @@ class MembrainBackend(StorageBackendInterface):
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
             self.http_session = None
-        
+
         # Shutdown thread pool
         if self.thread_pool is not None:
             try:
@@ -565,7 +568,7 @@ class MembrainBackend(StorageBackendInterface):
                 logger.info("Thread pool shutdown complete")
             except Exception as e:
                 logger.error(f"Error shutting down thread pool: {e}")
-        
+
         # Close shared memory resources
         with self.shared_memory_lock:
             if self.shared_memory_map is not None:
@@ -574,14 +577,14 @@ class MembrainBackend(StorageBackendInterface):
                 except Exception as e:
                     logger.error(f"Error releasing shared memory map: {e}")
                 self.shared_memory_map = None
-                
-            if self.shared_memory_obj is not None:  
+
+            if self.shared_memory_obj is not None:
                 try:
                     self.shared_memory_obj.close()
                 except Exception as e:
                     logger.error(f"Error closing shared memory: {e}")
                 self.shared_memory_obj = None
-        
+
         logger.info("MembrainBackend closed with all resources cleaned up.")
 
     # Helper methods
@@ -607,7 +610,7 @@ class MembrainBackend(StorageBackendInterface):
         tensor = memory_obj.tensor
         if tensor is None:
             return b""
-        
+
         # Store original properties before conversion
         original_shape = tensor.shape
         original_dtype = tensor.dtype
@@ -632,7 +635,7 @@ class MembrainBackend(StorageBackendInterface):
             except Exception as fallback_error:
                 logger.error(f"Emergency fallback also failed: {fallback_error}")
                 return b""
-        
+
         # Create metadata header for proper reconstruction
         metadata_dict = {
             'shape': list(original_shape),
@@ -641,13 +644,13 @@ class MembrainBackend(StorageBackendInterface):
             'format': original_format.value,
             'tensor_size': len(tensor_bytes)
         }
-        
+
         # Serialize metadata as JSON bytes
         metadata_json = json.dumps(metadata_dict).encode('utf-8')
         metadata_size = len(metadata_json)
-        
+
         # Format: [4 bytes metadata size][metadata json][tensor bytes]
         result = metadata_size.to_bytes(4, 'little') + metadata_json + tensor_bytes
-        
+
         logger.debug(f"Serialized tensor: shape={original_shape}, {original_dtype}->{serialized_dtype}, size={len(result)} bytes")
         return result
