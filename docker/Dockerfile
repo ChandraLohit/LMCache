@@ -126,6 +126,18 @@ uv pip install vllm[runai,tensorizer] --extra-index-url https://wheels.vllm.ai/n
 WORKDIR /workspace
 ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]
 
+#################### PROFILING BUILD ####################
+# Add NSys profiling tools to the image-build target
+FROM image-build AS profile-build
+
+RUN sudo chmod -R 777 /tmp/ && \
+    apt update && \
+    apt install -y --no-install-recommends gnupg && \
+    echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list && \
+    apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub && \
+    apt update && \
+    apt install nsight-systems-cli-2025.2.1=2025.2.1.130-252135690618v0
+
 #################### vLLM IMAGE & LMCache (Release) #######################
 # Integrate vLLM and LMCache stable releases and expose vLLM
 # OpenAI API
