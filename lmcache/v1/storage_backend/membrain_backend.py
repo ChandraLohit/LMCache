@@ -211,6 +211,9 @@ class MembrainBackend(StorageBackendInterface):
         self.shared_memory_map: Optional[memoryview] = None
         self.shared_memory_lock = threading.Lock()
 
+        # CUDA optimization: separate streams for operations
+        self.serialization_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
         logger.info(
             f"MembrainBackend initialized with URL: {self.membrain_url}, "
             f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}, "
@@ -520,10 +523,7 @@ class MembrainBackend(StorageBackendInterface):
             numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
 
             # Zero-copy numpy array creation
-            if isinstance(tensor_data, memoryview):
-                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
-            else:
-                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
+            numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
 
             # Create tensor without unnecessary copy
             reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
@@ -634,6 +634,9 @@ class MembrainBackend(StorageBackendInterface):
             except Exception as e:
                 logger.error(f"Error shutting down thread pool: {e}")
 
+        # CUDA streams cleanup: release references, PyTorch handles the rest
+        self.serialization_stream = None
+
         # Close shared memory resources
         with self.shared_memory_lock:
             if self.shared_memory_map is not None:
@@ -682,9 +685,20 @@ class MembrainBackend(StorageBackendInterface):
         original_dtype = tensor.dtype
         original_format = memory_obj.get_memory_format()
 
-        # Move to CPU if needed
+        # CUDA optimization: non-blocking GPU->CPU transfer with dedicated stream
         if tensor.is_cuda:
-            tensor = tensor.cpu()
+            if self.serialization_stream is not None:
+                with torch.cuda.stream(self.serialization_stream):
+                    # Use pinned memory for faster transfer
+                    cpu_tensor = torch.empty_like(tensor, device='cpu', pin_memory=True)
+                    cpu_tensor.copy_(tensor, non_blocking=True)
+                    # Only synchronize the serialization stream, not all CUDA operations
+                    self.serialization_stream.synchronize()
+                    tensor = cpu_tensor
+            else:
+                # Fallback for when CUDA streams not available
+                # This is a global synchronization and waits for everything on the GPU to finish
+                tensor = tensor.cpu()
 
         # Apply dtype conversion using centralized manager
         try:
