@@ -96,11 +96,11 @@ FROM base AS image-build
 COPY ./requirements/build.txt build.txt
 
 # Max jobs used by Ninja to build extensions
-ARG max_jobs=2
+ARG max_jobs=64
 ENV MAX_JOBS=${max_jobs}
 
 # Number of threads used by nvcc
-ARG nvcc_threads=8
+ARG nvcc_threads=64
 ENV NVCC_THREADS=$nvcc_threads
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -120,7 +120,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 # Install LMCache latest build and vLLM nightly build
 RUN . /opt/venv/bin/activate && \
-uv pip install vllm --extra-index-url https://wheels.vllm.ai/nightly && \
+uv pip install vllm && \
     uv pip install /workspace/LMCache/dist_lmcache/*.whl --verbose
 
 WORKDIR /workspace
