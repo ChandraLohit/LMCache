@@ -48,9 +48,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
-from lmcache.v1.config import (
-    LMCacheEngineConfig as V1Config,
-)
+from lmcache.v1.config import LMCacheEngineConfig as V1Config
 
 if TYPE_CHECKING:
     # Third Party
@@ -489,10 +487,13 @@ class LMCacheConnectorV1Impl:
 
     def _is_direct_remote_access(self, config: Union[Config, V1Config]) -> bool:
         # Handle various representations of zero: 0, 0.0, or very small values
-        is_zero_cpu = (isinstance(config.max_local_cpu_size, (int, float))
-                       and abs(config.max_local_cpu_size) < 0.001)
-        has_remote = ((config.remote_url is not None and config.remote_url.strip() != "")
-                      or (config.membrain_url is not None and config.membrain_url.strip() != ""))
+        is_zero_cpu = (
+            isinstance(config.max_local_cpu_size, (int, float))
+            and abs(config.max_local_cpu_size) < 0.001
+        )
+        has_remote = (
+            config.remote_url is not None and config.remote_url.strip() != ""
+        ) or (config.membrain_url is not None and config.membrain_url.strip() != "")
 
         return is_zero_cpu and has_remote
 

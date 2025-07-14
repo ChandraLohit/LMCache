@@ -715,11 +715,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         logger.error("Attempted to release unknown buffer")
 
     def batched_from_gpu_streaming(
-            self,
-            memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
-            starts: List[int],
-            ends: List[int],
-            **kwargs,
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
     ):
         """
         Stream-based KV cache transfer that uses fixed-size buffer pool.
@@ -777,7 +777,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         logger.debug(f"Completed streaming transfer for {self.num_layers} layers")
 
     def _process_layer_streaming(
-            self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping
+        self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping
     ):
         """Process a single layer using streaming buffer pool."""
 
@@ -811,7 +811,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     # Copy to memory objects
                     offset = 0
                     for start, end, memory_obj in zip(
-                            starts, ends, memory_objs_layer, strict=False
+                        starts, ends, memory_objs_layer, strict=False
                     ):
                         chunk_size = end - start
                         assert memory_obj.tensor is not None
@@ -845,18 +845,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
 
     def _process_layer_chunked(
-            self,
-            layer_id,
-            memory_objs_layer,
-            starts,
-            ends,
-            kvcaches,
-            slot_mapping,
-            streaming_buffer,
+        self,
+        layer_id,
+        memory_objs_layer,
+        starts,
+        ends,
+        kvcaches,
+        slot_mapping,
+        streaming_buffer,
     ):
         """Process layer in chunks when it doesn't fit in streaming buffer."""
         for start, end, memory_obj in zip(
-                starts, ends, memory_objs_layer, strict=False
+            starts, ends, memory_objs_layer, strict=False
         ):
             assert memory_obj.tensor is not None
 
@@ -891,11 +891,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 mem_offset += chunk_tokens
 
     def _process_layer_cpu_fallback(
-            self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping_full
+        self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping_full
     ):
         """CPU fallback when no streaming buffers available."""
         for start, end, memory_obj in zip(
-                starts, ends, memory_objs_layer, strict=False
+            starts, ends, memory_objs_layer, strict=False
         ):
             assert memory_obj.tensor is not None
 
@@ -1064,14 +1064,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         yield
 
     def _load_layer_with_streaming_buffer(
-            self,
-            layer_id,
-            memory_objs_layer,
-            starts,
-            ends,
-            kvcaches,
-            slot_mapping_full,
-            streaming_buffer,
+        self,
+        layer_id,
+        memory_objs_layer,
+        starts,
+        ends,
+        kvcaches,
+        slot_mapping_full,
+        streaming_buffer,
     ):
         """Load a layer using streaming buffer."""
         total_tokens = sum(
@@ -1082,7 +1082,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # All fits in streaming buffer
             buffer_offset = 0
             for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
+                starts, ends, memory_objs_layer, strict=False
             ):
                 assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
                 chunk_size = end - start
@@ -1103,7 +1103,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         else:
             # Process in chunks
             for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
+                starts, ends, memory_objs_layer, strict=False
             ):
                 assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
                 chunk_tokens = end - start
@@ -1123,8 +1123,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
                     # Create slot mapping for this chunk
                     chunk_slot_mapping = slot_mapping_full[
-                                         start + mem_offset : start + chunk_end
-                                         ]
+                        start + mem_offset : start + chunk_end
+                    ]
 
                     # Transfer to GPU
                     lmc_ops.single_layer_kv_transfer(
@@ -1139,11 +1139,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     mem_offset = chunk_end
 
     def _load_layer_direct(
-            self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping_full
+        self, layer_id, memory_objs_layer, starts, ends, kvcaches, slot_mapping_full
     ):
         """Direct loading without streaming buffer (fallback)."""
         for start, end, memory_obj in zip(
-                starts, ends, memory_objs_layer, strict=False
+            starts, ends, memory_objs_layer, strict=False
         ):
             assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
 
@@ -1162,11 +1162,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def batched_from_gpu(
-            self,
-            memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
-            starts: List[int],
-            ends: List[int],
-            **kwargs,
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
     ):
         """
         Main entry point for batched GPU to memory transfer.
