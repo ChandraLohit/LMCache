@@ -67,6 +67,7 @@ class LMCacheEngineConfig:
     remote_serde: Optional[str]  # Can be "naive" or "cachegen"
 
     use_layerwise: bool  # whether to use layerwise pipelining
+    use_streaming: bool # whether to use streaming gpu connector
 
     save_decode_cache: bool  # whether to store decode kv cache
 
@@ -168,6 +169,7 @@ class LMCacheEngineConfig:
         remote_url: Optional[str] = "lm://localhost:65432",
         remote_serde: Optional[str] = "naive",
         use_layerwise: bool = False,
+        use_streaming: bool = False,
         save_decode_cache: bool = False,
         enable_blending: bool = False,
         blend_recompute_ratio: float = 0.15,
@@ -218,6 +220,7 @@ class LMCacheEngineConfig:
             remote_url,
             remote_serde,
             use_layerwise,
+            use_streaming,
             save_decode_cache,
             enable_blending,
             blend_recompute_ratio,
@@ -362,6 +365,7 @@ class LMCacheEngineConfig:
         remote_serde = config.get("remote_serde", "naive")
 
         use_layerwise = config.get("use_layerwise", False)
+        use_streaming = config.get("use_streaming", False)
 
         save_decode_cache = config.get("save_decode_cache", False)
 
@@ -459,6 +463,7 @@ class LMCacheEngineConfig:
                 remote_url,
                 remote_serde,
                 use_layerwise,
+                use_streaming,
                 save_decode_cache,
                 enable_blending,
                 blend_recompute_ratio,
@@ -567,6 +572,10 @@ class LMCacheEngineConfig:
 
         config.use_layerwise = to_bool(
             parse_env(get_env_name("use_layerwise"), config.use_layerwise)
+        )
+
+        config.use_streaming = to_bool(
+            parse_env(get_env_name("use_streaming"), config.use_streaming)
         )
 
         config.save_decode_cache = to_bool(
@@ -791,6 +800,7 @@ class LMCacheEngineConfig:
             "remote_url": self.remote_url,
             "remote_serde": self.remote_serde,
             "use_layerwise": self.use_layerwise,
+            "use_streaming": self.use_streaming,
             "save_decode_cache": self.save_decode_cache,
             "enable_blending": self.enable_blending,
             "blend_recompute_ratio": self.blend_recompute_ratio,

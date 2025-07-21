@@ -62,6 +62,7 @@ from lmcache.v1.gpu_connector import (
     VLLMBufferLayerwiseGPUConnector,
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
+    VLLMStreamingLayerwiseGPUConnector
 )
 
 # FIXME(Jiayi): temporarily comment this out
@@ -186,6 +187,7 @@ def init_lmcache_engine(
         VLLMBufferLayerwiseGPUConnector,
         VLLMPagedMemGPUConnectorV2,
         VLLMPagedMemLayerwiseGPUConnector,
+        VLLMStreamingLayerwiseGPUConnector,
     ]
 
     if use_mla and config.use_layerwise:
@@ -197,6 +199,15 @@ def init_lmcache_engine(
         if config.enable_blending:
             # Use layerwise connector for blending
             vllm_gpu_connector = VLLMBufferLayerwiseGPUConnector(
+                hidden_dim_size,
+                num_layer,
+                use_gpu=use_gpu,
+                chunk_size=chunk_size,
+                dtype=kv_dtype,
+                device=device,
+            )
+        elif config.use_streaming:
+            vllm_gpu_connector = VLLMStreamingLayerwiseGPUConnector(
                 hidden_dim_size,
                 num_layer,
                 use_gpu=use_gpu,
