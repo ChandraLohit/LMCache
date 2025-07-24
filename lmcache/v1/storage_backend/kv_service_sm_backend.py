@@ -79,8 +79,7 @@ class KVServiceSMBackend(StorageBackendInterface):
         # KVServiceSM configuration
         self.base_url = getattr(config, "kv_service_sm_url", "http://localhost:9200")
 
-        extra_config = getattr(config, "extra_config", {})
-
+        extra_config = getattr(config, "extra_config", None) or {}
         self.shared_memory_name = extra_config.get(
             "kv_service_sm_shared_memory_name", "shared_memory"
         )
