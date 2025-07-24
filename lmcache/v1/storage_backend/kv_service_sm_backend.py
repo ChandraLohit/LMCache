@@ -22,6 +22,7 @@ import threading
 
 # Third Party
 import aiohttp
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -428,9 +429,6 @@ class KVServiceSMBackend(StorageBackendInterface):
                 actual_shape_list.append(dim)
 
             # Convert back to torch.Size
-            # Third Party
-            import torch
-
             actual_shape = (
                 torch.Size(actual_shape_list) if actual_shape_list else torch.Size([1])
             )
@@ -597,9 +595,6 @@ class KVServiceSMBackend(StorageBackendInterface):
             padded_shape = list(kv_shape[:4])
 
         # Convert to torch.Size with exactly 4 dimensions
-        # Third Party
-        import torch
-
         padded_torch_shape = torch.Size(padded_shape)
 
         # Use existing RemoteMetadata from protocol.py
